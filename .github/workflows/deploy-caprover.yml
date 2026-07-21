@@ -1,0 +1,21 @@
+name: Deploy to CapRover
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-caprover-main
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy
+        uses: caprover/deploy-from-github@v1.1.2
+        with:
+          server: ${{ secrets.CAPROVER_SERVER }}
+          app: ${{ secrets.APP_NAME }}
+          token: ${{ secrets.APP_TOKEN }}
+          branch: main
