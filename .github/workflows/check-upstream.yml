@@ -1,0 +1,157 @@
+name: Check upstream updates
+
+on:
+  schedule:
+    # Every day at 13:00 UTC — 8:00 AM Colombia
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+
+# GITHUB_TOKEN cannot push changes to .github/workflows/*.yml.
+# Use UPSTREAM_SYNC_TOKEN (PAT with repo/contents + workflow + pull-requests).
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch original repository
+        run: |
+          git remote add upstream https://github.com/rmyndharis/OpenWA.git
+          git fetch upstream main
+
+      - name: Check for upstream updates
+        id: upstream
+        shell: bash
+        run: |
+          COMMITS_BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "commits_behind=$COMMITS_BEHIND" >> "$GITHUB_OUTPUT"
+
+          if [ "$COMMITS_BEHIND" -gt 0 ]; then
+            echo "Updates found: $COMMITS_BEHIND commit(s)"
+          else
+            echo "Fork is already up to date"
+          fi
+
+      - name: Create synchronization branch
+        if: steps.upstream.outputs.commits_behind != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout -B chore/sync-upstream
+
+          set +e
+          git merge upstream/main --no-edit
+          merge_status=$?
+          set -e
+
+          if [ "$merge_status" -ne 0 ]; then
+            # Keep CapRover-only CI: drop upstream Actions workflows we intentionally removed.
+            for f in \
+              .github/workflows/ci.yml \
+              .github/workflows/release.yml \
+              .github/workflows/sdk-ci.yml \
+              .github/workflows/java-sdk-release.yml \
+              .github/workflows/split-php-sdk.yml
+            do
+              if git ls-files -u -- "$f" | grep -q .; then
+                git rm -f --ignore-unmatch "$f"
+              fi
+            done
+
+            if git ls-files -u -- .github/workflows/deploy-caprover.yml | grep -q .; then
+              git checkout --ours -- .github/workflows/deploy-caprover.yml
+              git add .github/workflows/deploy-caprover.yml
+            fi
+
+            if git ls-files -u | grep -q .; then
+              echo "Unresolved merge conflicts remain:"
+              git ls-files -u
+              exit 1
+            fi
+
+            git commit --no-edit -m "chore: sync upstream/main into fork"
+          fi
+
+          git push origin chore/sync-upstream --force-with-lease
+
+      - name: Open or update pull request
+        id: pr
+        if: steps.upstream.outputs.commits_behind != '0'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          head_ref="${GITHUB_REPOSITORY_OWNER}:chore/sync-upstream"
+
+          existing_pr() {
+            gh api "repos/${GITHUB_REPOSITORY}/pulls" \
+              --jq ".[] | select(.head.label == \"${head_ref}\" and .base.ref == \"main\" and .state == \"open\") | .number" \
+              | head -n1
+          }
+
+          EXISTING_PR=$(existing_pr)
+          if [ -n "$EXISTING_PR" ]; then
+            echo "Upstream synchronization PR #$EXISTING_PR already exists."
+            echo "pr_number=$EXISTING_PR" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BODY='Automated sync from `rmyndharis/OpenWA:main`.
+
+Merging this PR into `main` triggers **Deploy to CapRover**.'
+
+          if PR_URL=$(gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head chore/sync-upstream \
+            --title "chore: sync updates from upstream OpenWA" \
+            --body "$BODY"); then
+            echo "Created $PR_URL"
+            echo "pr_number=${PR_URL##*/}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          EXISTING_PR=$(existing_pr)
+          if [ -n "$EXISTING_PR" ]; then
+            echo "Upstream synchronization PR #$EXISTING_PR already exists."
+            echo "pr_number=$EXISTING_PR" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Failed to create or find an upstream synchronization PR."
+          exit 1
+
+      - name: Merge sync PR (triggers CapRover deploy)
+        if: steps.upstream.outputs.commits_behind != '0' && steps.pr.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PR_NUMBER="${{ steps.pr.outputs.pr_number }}"
+
+          if gh pr merge "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --merge \
+            --delete-branch; then
+            echo "Merged PR #$PR_NUMBER — CapRover deploy will run on main."
+            exit 0
+          fi
+
+          echo "Could not merge PR #$PR_NUMBER (likely conflicts). Merge manually."
+          exit 1
