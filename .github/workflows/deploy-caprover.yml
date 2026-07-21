@@ -18,12 +18,12 @@ jobs:
 
       - name: Create deploy archive
         run: |
-          tar -czf deploy.tar \
-            --exclude=./.git \
-            --exclude=./node_modules \
-            --exclude=./dashboard/node_modules \
-            --exclude=./deploy.tar \
-            .
+          tar -czf /tmp/deploy.tar \
+            --exclude=.git \
+            --exclude=node_modules \
+            --exclude=dashboard/node_modules \
+            -C "$GITHUB_WORKSPACE" .
+          mv /tmp/deploy.tar "$GITHUB_WORKSPACE/deploy.tar"
 
       - name: Deploy to CapRover
         uses: caprover/deploy-from-github@v1.1.2
