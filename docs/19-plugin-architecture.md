@@ -163,8 +163,8 @@ a host version. The config schema is the top-level `configSchema` (note: not nes
 | `sessions` | — | Session ids this plugin may act on, or `['*']`. Absent = `['*']`. Static — editing config can't widen it |
 | `sessionScoped` | — | Default `true`. A scoped plugin only sees events for the sessions it's activated for; `false` = always runs |
 | `net.allow` | — | Outbound-HTTP host allowlist for `ctx.net.fetch` (`host`, `host:port`, or `'*'`). Absent = deny all |
-| `configSchema` | — | Declarative config schema the dashboard renders into a form |
-| `configUi` | — | Optional self-contained HTML config editor served into a sandboxed iframe (preferred over `configSchema` when present) |
+| `configSchema` | — | Declarative config schema the dashboard renders as an always-available form fallback |
+| `configUi` | — | Optional self-contained HTML config editor served into a sandboxed iframe alongside `configSchema` when both exist |
 | `hooks` | — | Hook events this plugin listens to (informational) |
 | `provides` / `requires` | — | Features this plugin provides / depends on |
 | `i18n` | — | Localized dashboard text per locale (dashboard-only) |
@@ -417,8 +417,21 @@ sub-directory with a `manifest.json` it reads the manifest, validates the requir
 entry — **without running any plugin code**. Persisted config and per-session activation/config are
 read back so an operator's choices survive a restart. There is **no** version-compatibility check.
 
-> Loading a plugin from disk never auto-enables it. A previously-enabled plugin returns as `INSTALLED`
-> after a restart and must be re-enabled — enabling is always an explicit ADMIN action.
+> Loading a plugin from disk never runs it: a load always yields `INSTALLED`. Enabling is a separate
+> step that runs the lifecycle, and happens either on an explicit ADMIN action or — for a plugin the
+> operator had already enabled — at bootstrap (see **Restore on boot** below).
+
+**Restore on boot.** `status` describes where the runtime is, so it cannot carry the operator's
+decision across a restart; the decision is persisted separately as `enabledByOperator`. On
+`onApplicationBootstrap` — after the rest of the app is wired — the loader re-enables every non-built-in
+plugin carrying that flag, so an upgrade, host reboot or container restart no longer silently switches
+off every extension ([#856](https://github.com/rmyndharis/OpenWA/issues/856)). Restoring is best-effort
+and sequential: a plugin that fails is logged (`plugin_restore_failed`), left in `ERROR`, and never
+holds up startup. Built-ins are skipped — `EngineFactory` enables the engine named by `engine.type`.
+
+> The flag is written **only** by the operator-facing enable/disable, never by the loader.
+> `onModuleDestroy` disables every running plugin during a graceful shutdown, so a loader-side write
+> would erase the decision on the way out.
 
 **Enable.** `enablePlugin(id)` runs the lifecycle by trust tier (a synchronous lock prevents a racing
 double-enable, and engines must match the configured active engine):
@@ -531,8 +544,9 @@ URL / catalog), not an npm/github source descriptor.
 
 > `GET /plugins/:id/config-ui` returns untrusted HTML served with `Content-Security-Policy: sandbox`
 > and `X-Content-Type-Options: nosniff`. The dashboard fetches it **with** the API key and injects the
-> body as an iframe `srcdoc` (opaque origin); the editor exchanges config over a `postMessage` bridge,
-> so the API key never reaches the iframe.
+> body as an iframe `srcdoc` (opaque origin), applying the current document's CSP nonce to inline scripts;
+> the editor exchanges config over a `postMessage` bridge, so the API key never reaches the iframe. If
+> the bridge does not initialize, the dashboard shows an error and keeps a declared `configSchema` form usable.
 
 ## 19.9 Plugin Security
 
