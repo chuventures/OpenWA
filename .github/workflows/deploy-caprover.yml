@@ -3,6 +3,7 @@ name: Deploy to CapRover
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: deploy-caprover-main
@@ -12,10 +13,21 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create deploy archive
+        run: |
+          tar -czf deploy.tar \
+            --exclude=./.git \
+            --exclude=./node_modules \
+            --exclude=./dashboard/node_modules \
+            --exclude=./deploy.tar \
+            .
+
+      - name: Deploy to CapRover
         uses: caprover/deploy-from-github@v1.1.2
         with:
           server: ${{ secrets.CAPROVER_SERVER }}
           app: ${{ secrets.APP_NAME }}
           token: ${{ secrets.APP_TOKEN }}
-          branch: main
