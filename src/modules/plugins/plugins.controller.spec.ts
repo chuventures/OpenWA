@@ -1,6 +1,6 @@
 import { Reflector } from '@nestjs/core';
 import { PluginsController } from './plugins.controller';
-import { REQUIRED_ROLE_KEY } from '../auth/decorators/auth.decorators';
+import { REQUIRED_ROLE_KEY, UNSCOPED_KEY } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
 
 describe('PluginsController authorization', () => {
@@ -18,11 +18,20 @@ describe('PluginsController authorization', () => {
     'updateConfig',
     'getConfigUi',
     'updateSessionConfig',
+    'updateSessions',
   ] as const;
 
   it.each(adminOnly)('%s requires the ADMIN role', method => {
+    // Metadata lookup key, never invoked — see the same note in infra.controller.spec.ts.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
     const handler = PluginsController.prototype[method];
     const role = reflector.get<ApiKeyRole | undefined>(REQUIRED_ROLE_KEY, handler);
     expect(role).toBe(ApiKeyRole.ADMIN);
+  });
+
+  it('updateSessions requires an unrestricted key because updateSessions replaces the complete active set', () => {
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const handler = PluginsController.prototype.updateSessions;
+    expect(reflector.get<boolean>(UNSCOPED_KEY, handler)).toBe(true);
   });
 });
