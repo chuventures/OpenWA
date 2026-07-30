@@ -2467,9 +2467,10 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
    * `client.sendMessage()` can RESOLVE with `undefined` instead of throwing, and it collapses two
    * opposite outcomes into that one value (`Client.js:1558`): the chat could not be resolved so nothing
    * was sent (`if (!chat) return null`, `Client.js:1539`), or the message went out and only its id could
-   * not be read back (`Msg.get` miss, `Injected/Utils.js:585`). Nothing here can tell those apart, so an
-   * absent message is reported as a failed send: a false negative is visible and retryable, while
-   * claiming delivery for a message that never left is not recoverable. wwebjs's own typings hide the
+   * not be read back (`Msg.get` miss, `Injected/Utils.js:585`). Those are indistinguishable here. We used
+   * to report failure (false-negative preferred), but that caused OTP/alert callers to retry and
+   * duplicate messages that had already landed. Prefer the empty-id success sentinel; delivery certainty
+   * belongs to `message.ack` / chat history, not the sync HTTP response. wwebjs's own typings hide the
    * case entirely — `index.d.ts` declares `Promise<Message>`, so `strict` never flagged these reads.
    *
    * A `Message` instance is different: wwebjs only builds one from a real message model, so its presence
@@ -2478,10 +2479,17 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
    * fabricated id that a later ack could mis-match.
    */
   private toMessageResult(msg: Message | undefined): MessageResult {
+    // `Client.sendMessage()` can resolve with `undefined` without throwing (Client.js:1558),
+    // collapsing two outcomes: chat not resolved (nothing sent) OR message dispatched but id
+    // unreadable (common after WA Web id-field renames). Reporting that as HTTP 500 makes
+    // callers retry and duplicate a message that already landed. Prefer the same "sent, id
+    // unknown" sentinel we use when a Message exists but its id cannot be read — callers that
+    // need delivery certainty should watch `message.ack` / chat history, not the sync response.
     if (!msg) {
-      throw new Error(
-        'the engine returned no message for this send, so it may not have been delivered — check the chat before retrying',
+      this.logger.warn(
+        'Engine resolved send without a message object; treating as sent with unknown id (may be a false positive if the chat was missing)',
       );
+      return { id: '', timestamp: Math.floor(Date.now() / 1000) };
     }
     const id = msg.id as unknown as SerializedWid | undefined;
     return { id: id?._serialized ?? id?.$1 ?? '', timestamp: msg.timestamp };

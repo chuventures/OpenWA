@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Outbound sends that WhatsApp already accepted no longer return HTTP 500.** `Client.sendMessage()`
+  can resolve with `undefined` after the message is on the wire (id readback miss after WA Web field
+  renames). That used to surface as Nest's opaque `{"message":"Internal server error"}`, so callers
+  like OTP/alert integrations retried and duplicated a message the recipient already had. An absent
+  message object is now treated as sent with an unknown id (empty `messageId`), matching the existing
+  "Message exists but id unreadable" path. Real engine failures still map to a `400` with the engine's
+  error text instead of a swallowed production 500.
+
 - **Plugins you enabled stay enabled across a restart.** Every restart of the gateway — an upgrade, a
   host reboot, a container restart policy — silently switched off every extension plugin, with nothing
   written to the log and nothing shown in the dashboard. An integration such as the Chatwoot adapter

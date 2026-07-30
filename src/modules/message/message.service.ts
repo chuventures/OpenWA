@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, Optional } from '@nestjs/common';
+import { Injectable, BadRequestException, HttpException, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -721,7 +721,13 @@ export class MessageService {
       this.logger.warn(`Outbound media fetch blocked by SSRF guard: ${error.message}`);
       return new BadRequestException(SSRF_BLOCKED_CLIENT_MESSAGE);
     }
-    return error;
+    // Bare Errors become Nest's opaque `{"message":"Internal server error"}` in production.
+    // Preserve real HttpExceptions; wrap everything else so callers see the engine reason.
+    if (error instanceof HttpException) {
+      return error;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return new BadRequestException(message || 'Failed to send WhatsApp message');
   }
 
   private buildMediaInput(dto: SendMediaMessageDto): MediaInput {

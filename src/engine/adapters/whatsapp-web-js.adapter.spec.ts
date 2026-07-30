@@ -2728,17 +2728,16 @@ describe('WhatsAppWebJsAdapter send-result contract', () => {
     return adapter;
   };
 
-  it('reports a send as failed when the engine resolves without a message', async () => {
-    // The dangerous case: `undefined` means EITHER the chat never resolved and nothing was sent, OR the
-    // message went out and only its id was unreadable. Indistinguishable here — so this must not be
-    // reported as success. A false negative is retryable; a 201 for a message that never left is not.
+  it('treats an undefined engine result as sent with unknown id (avoids false-negative retries)', async () => {
+    // `undefined` means EITHER the chat never resolved OR the message went out and only its id was
+    // unreadable. Reporting failure here caused callers (OTP/alerts) to retry and duplicate a message
+    // that had already landed. Prefer the empty-id success sentinel; delivery certainty is async.
     const sendMessage = jest.fn().mockResolvedValue(undefined);
 
-    await expect(readyAdapter({ sendMessage }).sendTextMessage('621@c.us', 'hi')).rejects.toThrow(
-      /may not have been delivered/,
-    );
-    // Regression guard: the old code dereferenced `msg.id` and surfaced an opaque TypeError instead.
-    await expect(readyAdapter({ sendMessage }).sendTextMessage('621@c.us', 'hi')).rejects.not.toThrow(TypeError);
+    const res = await readyAdapter({ sendMessage }).sendTextMessage('621@c.us', 'hi');
+
+    expect(res.id).toBe('');
+    expect(typeof res.timestamp).toBe('number');
   });
 
   it('returns the empty no-id sentinel when the message exists but its id is unreadable', async () => {
