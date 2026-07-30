@@ -1,7 +1,7 @@
 import { isIPv4, isIPv6, type LookupFunction } from 'net';
 import { lookup } from 'dns/promises';
 import { type LookupAddress, type LookupOptions } from 'dns';
-import { Agent, fetch as undiciFetch, type RequestInit, type Response } from 'undici';
+import { Agent, fetch as undiciFetch, Headers, type RequestInit, type Response } from 'undici';
 
 /** Thrown when an outbound URL is blocked by the SSRF guard. */
 export class SsrfBlockedError extends Error {
@@ -231,6 +231,12 @@ function resolveDnsTimeoutMs(): number {
   return Number.isInteger(n) && n > 0 ? n : DEFAULT_DNS_TIMEOUT_MS;
 }
 
+/** Redirect hops followed on the guarded download path before the chain is refused. */
+const MAX_REDIRECT_HOPS = 5;
+
+/** Status codes undici surfaces as a redirect when `redirect: 'manual'` is set. */
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
 /**
  * Resolve a host with `{ all: true }`, bounded by a deadline so a hanging/slow DNS resolver cannot
  * pin a worker indefinitely (the lookup is otherwise unbounded). The default deadline is generous
@@ -239,21 +245,33 @@ function resolveDnsTimeoutMs(): number {
  * its late result swallowed (no unhandledRejection). Wrapping the rejection keeps every resolution
  * failure typed, so callers map it to a 4xx instead of leaking a raw DNS error as a generic 500.
  */
-async function lookupWithDeadline(host: string): Promise<LookupAddress[]> {
+async function lookupWithDeadline(host: string, signal?: AbortSignal | null): Promise<LookupAddress[]> {
+  // An abort that already fired between hops burns no DNS query at all.
+  if (signal?.aborted) throw signal.reason;
   const lookupPromise = lookup(host, { all: true });
   lookupPromise.catch(() => undefined); // swallow a late rejection if the deadline already fired
   let timer: NodeJS.Timeout | undefined;
+  let onAbort: (() => void) | undefined;
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new SsrfBlockedError(`Timed out resolving host: ${host}`)), resolveDnsTimeoutMs());
+    if (signal) {
+      // Reject with the signal's own reason — for AbortSignal.timeout that is the same TimeoutError
+      // a fetch-phase abort produces. Never an SsrfBlockedError: a caller timeout is not an SSRF
+      // block, and the redaction layer must not rewrite it into "destination not allowed".
+      onAbort = () => reject(signal.reason as Error);
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
   });
   try {
     return await Promise.race([lookupPromise, deadline]);
   } catch (err) {
+    if (signal?.aborted) throw signal.reason; // the caller's abort wins over a simultaneous DNS error
     if (err instanceof SsrfBlockedError) throw err; // deadline already produced a typed error
     const code = (err as NodeJS.ErrnoException)?.code;
     throw new SsrfBlockedError(`Could not resolve host: ${host}${code ? ` (${code})` : ''}`);
   } finally {
     if (timer) clearTimeout(timer);
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort);
   }
 }
 
@@ -269,7 +287,10 @@ async function lookupWithDeadline(host: string): Promise<LookupAddress[]> {
  * unpinned, since the operator opts in to whatever its DNS returns) or a literal IP (no DNS, so no
  * rebind is possible — fetch connects straight to the validated literal).
  */
-export async function resolveSafeFetchTarget(rawUrl: string): Promise<LookupAddress[] | null> {
+export async function resolveSafeFetchTarget(
+  rawUrl: string,
+  signal?: AbortSignal | null,
+): Promise<LookupAddress[] | null> {
   let url: URL;
   try {
     url = new URL(rawUrl);
@@ -294,7 +315,7 @@ export async function resolveSafeFetchTarget(rawUrl: string): Promise<LookupAddr
     return null; // literal IP — fetch connects directly, nothing to rebind
   }
 
-  const resolved = await lookupWithDeadline(host);
+  const resolved = await lookupWithDeadline(host, signal);
   if (resolved.length === 0) {
     throw new SsrfBlockedError(`Could not resolve host: ${host}`);
   }
@@ -310,8 +331,8 @@ export async function resolveSafeFetchTarget(rawUrl: string): Promise<LookupAddr
  * Backwards-compatible assertion form: validate the URL (used at webhook registration time, where
  * only the throw/no-throw outcome matters).
  */
-export async function assertSafeFetchUrl(rawUrl: string): Promise<void> {
-  await resolveSafeFetchTarget(rawUrl);
+export async function assertSafeFetchUrl(rawUrl: string, signal?: AbortSignal | null): Promise<void> {
+  await resolveSafeFetchTarget(rawUrl, signal);
 }
 
 /**
@@ -332,49 +353,70 @@ export function pinnedLookup(addresses: LookupAddress[]): LookupFunction {
 }
 
 /**
- * A `connect.lookup` that resolves EVERY host it is asked to connect to and refuses any that resolve
- * to an internal/reserved address. Used by the redirect-following download path so that each hop —
- * the original URL AND every redirect target — is validated at connect time, not just the first one.
- * This closes the redirect-bypass hole a single-host pin can't: a 3xx to an internal host is rejected
- * at the socket. Allowlisted hosts (SSRF_ALLOWED_HOSTS) are resolved without the block check, matching
- * {@link resolveSafeFetchTarget}.
+ * Cancel an unread response body before the per-request dispatcher is destroyed.
+ *
+ * Status-only callers (webhook delivery) often leave `response.body` unread. When undici then
+ * tears down the socket — or the peer resets it mid-flight — the body stream can emit an `error`
+ * (`TypeError: terminated` / `ECONNRESET`) with no listener, which becomes a process-fatal
+ * `uncaughtException` (see #887). Cancelling here drains that path safely; already-consumed
+ * bodies (`bodyUsed`) are left alone so streaming readers (media / plugin downloads) are unaffected.
  */
-export function validatingLookup(): LookupFunction {
-  const fn = (hostname: string, options: LookupOptions, callback: (...args: unknown[]) => void): void => {
-    const host = hostname.replace(/^\[|\]$/g, ''); // strip IPv6 brackets
-    const allowlisted = getAllowedHosts().has(host.toLowerCase());
-    const finish = (addrs: LookupAddress[]): void => {
-      if (options.all) callback(null, addrs);
-      else callback(null, addrs[0].address, addrs[0].family);
-    };
+async function settleUnreadResponseBody(response: Response): Promise<void> {
+  // bodyUsed only covers *disturbed* streams. A stream the caller locked with getReader() but never
+  // read from is not disturbed, and cancel() on a locked stream rejects — such callers must cancel
+  // their own reader on error paths, so locked streams are left to them.
+  if (response.bodyUsed || !response.body || response.body.locked) return;
+  // Guard the call itself: a duck-typed response (e.g. a test mock without cancel) must not throw
+  // synchronously from a `finally` and mask the original error.
+  if (typeof response.body.cancel !== 'function') return;
+  await response.body.cancel().catch(() => undefined);
+}
 
-    if (isIPv4(host) || isIPv6(host)) {
-      if (!allowlisted && isBlockedAddress(host)) {
-        callback(new SsrfBlockedError(`Blocked internal address: ${host}`));
-        return;
-      }
-      finish([{ address: host, family: isIPv6(host) ? 6 : 4 }]);
-      return;
-    }
+/**
+ * Run `use(response)` and always settle an unread body afterwards, even if `use` throws.
+ */
+async function useAndSettleBody<T>(response: Response, use: (response: Response) => Promise<T> | T): Promise<T> {
+  try {
+    return await use(response);
+  } finally {
+    await settleUnreadResponseBody(response);
+  }
+}
 
-    lookupWithDeadline(host)
-      .then(resolved => {
-        if (resolved.length === 0) {
-          callback(new SsrfBlockedError(`Could not resolve host: ${host}`));
-          return;
-        }
-        if (!allowlisted) {
-          const bad = resolved.find(a => isBlockedAddress(a.address));
-          if (bad) {
-            callback(new SsrfBlockedError(`Host ${host} resolves to a blocked internal address: ${bad.address}`));
-            return;
-          }
-        }
-        finish(resolved);
-      })
-      .catch((err: unknown) => callback(err instanceof Error ? err : new Error(String(err))));
-  };
-  return fn as unknown as LookupFunction;
+/**
+ * Escape hatch for deployments whose plugin vendor / release host legitimately redirects an https
+ * URL to a plain-http hop (e.g. behind TLS-terminating infrastructure). Default OFF: an https→http
+ * downgrade hop is refused because the payload on this path is executable code and an http hop
+ * exposes it to on-path substitution. Set PLUGIN_DOWNLOAD_ALLOW_INSECURE_REDIRECTS=true to allow.
+ */
+function isInsecureRedirectHopAllowed(): boolean {
+  return process.env.PLUGIN_DOWNLOAD_ALLOW_INSECURE_REDIRECTS === 'true';
+}
+
+/**
+ * undici's native redirector strips credentials on cross-origin hops and rewrites 301/302/303 to a
+ * bodiless GET — the manual loop must do the same, or a redirect target would receive the original
+ * request's Authorization/Cookie headers and body.
+ */
+function nextRedirectHopInit(init: RequestInit, status: number, nextUrl: string, initialOrigin: string): RequestInit {
+  let next = init;
+  if (
+    status !== 307 &&
+    status !== 308 &&
+    next.method !== undefined &&
+    next.method !== 'GET' &&
+    next.method !== 'HEAD'
+  ) {
+    next = { ...next, method: 'GET' };
+    delete next.body;
+  }
+  if (new URL(nextUrl).origin !== initialOrigin && next.headers !== undefined) {
+    const headers = new Headers(next.headers);
+    headers.delete('authorization');
+    headers.delete('cookie');
+    next = { ...next, headers };
+  }
+  return next;
 }
 
 /**
@@ -386,7 +428,9 @@ export function validatingLookup(): LookupFunction {
  * so A-record failover still works. Redirects are refused (the guard only validated the original host).
  *
  * `use` must read everything it needs from the response before returning — the dispatcher (and its
- * sockets) is destroyed once `use` settles, so a still-streaming body would be cut off.
+ * sockets) is destroyed once `use` settles, so a still-streaming body would be cut off. Unread
+ * bodies are cancelled automatically before teardown so status-only callers cannot crash the process
+ * when the peer resets the connection (#887).
  *
  * @param opts.guard - when false (the WEBHOOK_SSRF_PROTECT opt-out), skips validation/pinning and
  *   performs a plain redirect-following fetch. Defaults to true (always guard).
@@ -399,30 +443,69 @@ export async function withSafeFetch<T>(
 ): Promise<T> {
   const guard = opts.guard ?? true;
   if (!guard) {
-    return use(await undiciFetch(rawUrl, { ...init, redirect: 'follow' }));
+    return useAndSettleBody(await undiciFetch(rawUrl, { ...init, redirect: 'follow' }), use);
   }
 
   if (opts.followRedirects) {
     // Download path (plugin .zip / catalog JSON): public release hosts legitimately 302 to a CDN, so
-    // refusing every redirect breaks them. Follow redirects, but SECURELY — instead of pinning one
-    // host's IPs, route the connection through a lookup that resolves+validates EVERY host on demand,
-    // so each hop (original + every redirect target) is checked at connect time and a 3xx to an
-    // internal host is blocked at the socket. The scheme/host of the original URL is validated first.
-    await resolveSafeFetchTarget(rawUrl);
-    const dispatcher = new Agent({ connect: { lookup: validatingLookup() } });
-    try {
-      return await use(await undiciFetch(rawUrl, { ...init, redirect: 'follow', dispatcher }));
-    } finally {
-      await dispatcher.destroy().catch(() => undefined);
+    // refusing every redirect breaks them. Follow them manually and re-validate EVERY hop with
+    // resolveSafeFetchTarget, which rejects blocked IP literals directly.
+    //
+    // Do NOT delegate hop checking to an Agent's `connect.lookup`: Node skips DNS entirely for an
+    // IP-literal host, so a custom lookup is never invoked for `Location: http://127.0.0.1/` and the
+    // hop goes unchecked. Each hop below is validated BEFORE its socket is opened.
+    let currentUrl = rawUrl;
+    let initialOrigin: string | undefined;
+    let hopInit = init;
+    let sawSecureHop = false;
+    for (let hop = 0; ; hop++) {
+      const target = await resolveSafeFetchTarget(currentUrl, init.signal);
+      // Parsed already by resolveSafeFetchTarget above, so this cannot throw.
+      const current = new URL(currentUrl);
+      initialOrigin ??= current.origin;
+      // A hop that downgrades https→http exposes the (executable) download to on-path substitution.
+      // Chains that STARTED on plain http are unaffected — they were never secure to begin with.
+      if (current.protocol === 'http:' && sawSecureHop && !isInsecureRedirectHopAllowed()) {
+        throw new Error(`Refusing redirect that downgrades from https to http: ${currentUrl}`);
+      }
+      if (current.protocol === 'https:') sawSecureHop = true;
+      const dispatcher = target ? new Agent({ connect: { lookup: pinnedLookup(target) } }) : undefined;
+      try {
+        const response = await undiciFetch(currentUrl, { ...hopInit, redirect: 'manual', dispatcher });
+        if (!REDIRECT_STATUSES.has(response.status)) {
+          return await useAndSettleBody(response, use);
+        }
+        const location = response.headers.get('location');
+        await settleUnreadResponseBody(response);
+        if (!location) {
+          throw new SsrfBlockedError(`Redirect from ${currentUrl} carried no Location header`);
+        }
+        if (hop >= MAX_REDIRECT_HOPS) {
+          // Deliberately NOT an SsrfBlockedError: this is an actionable operator error, not a
+          // blocked-address rejection, so it must survive redactSsrfError verbatim.
+          throw new Error(`Too many redirects while fetching ${rawUrl}`);
+        }
+        const nextUrl = new URL(location, currentUrl).toString();
+        hopInit = nextRedirectHopInit(hopInit, response.status, nextUrl, initialOrigin);
+        currentUrl = nextUrl;
+      } finally {
+        if (dispatcher) await dispatcher.destroy().catch(() => undefined);
+      }
     }
   }
 
-  const target = await resolveSafeFetchTarget(rawUrl);
+  const target = await resolveSafeFetchTarget(rawUrl, init.signal);
   const dispatcher = target ? new Agent({ connect: { lookup: pinnedLookup(target) } }) : undefined;
   try {
     const response = await undiciFetch(rawUrl, { ...init, redirect: 'manual', dispatcher });
-    assertNoRedirect(response, rawUrl);
-    return await use(response);
+    try {
+      assertNoRedirect(response, rawUrl);
+      return await use(response);
+    } finally {
+      // Settle even when assertNoRedirect throws: a refused 3xx still carries an unread body,
+      // and tearing the dispatcher down with it open is the same crash path as #887.
+      await settleUnreadResponseBody(response);
+    }
   } finally {
     if (dispatcher) await dispatcher.destroy().catch(() => undefined);
   }
