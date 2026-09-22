@@ -30,7 +30,12 @@ const FAILURE_BACKOFF_MS = 60_000;
 // published at least this long ago is far less likely to hang before reaching QR readiness on a
 // fresh start (the #488 / #684 failure class). Exposed for tests.
 export const WEB_VERSION_SETTLE_MS = 12 * 60 * 60 * 1000; // 12h
+// How long a resolved build is reused before the registry is asked again. Caching for the process
+// lifetime left a long-running container pinning a weeks-old build on every reconnect, and WhatsApp
+// unlinks (LOGOUT) a device on a retired build — which then deletes the stored login. Exposed for tests.
+export const WEB_VERSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 let cachedCurrentVersion: string | undefined;
+let cachedAt = 0;
 let inFlight: Promise<string | null> | null = null;
 let lastFailureAt = 0;
 
@@ -39,6 +44,7 @@ let warnedRemoteTrust = false;
 /** Test-only: reset the resolved-version cache between cases. */
 export function __resetWebVersionCache(): void {
   cachedCurrentVersion = undefined;
+  cachedAt = 0;
   inFlight = null;
   lastFailureAt = 0;
   warnedRemoteTrust = false;
@@ -102,17 +108,20 @@ export function pickSettledWebVersion(versions: unknown, now: number, currentVer
 
 /**
  * Fetch the current known-good WhatsApp Web build from the wa-version registry. A SUCCESSFUL resolve
- * is cached for the process lifetime; a failure resolves to null WITHOUT caching, so a later call
- * retries (a single transient outage must not permanently defeat the #488 fix). Concurrent callers
+ * is cached for `WEB_VERSION_CACHE_TTL_MS`, then refreshed; a failed refresh keeps serving the last
+ * good build, and a failure with nothing cached resolves to null, so a later call retries (a single
+ * transient outage must not permanently defeat the #488 fix). Concurrent callers
  * share one in-flight fetch. Prefers a build that has settled (see `pickSettledWebVersion`) over the
  * registry's possibly-minute-old `currentVersion`.
  */
 export async function resolveCurrentWebVersion(fetcher: typeof fetch = fetch): Promise<string | null> {
-  if (typeof cachedCurrentVersion === 'string') return cachedCurrentVersion;
+  if (typeof cachedCurrentVersion === 'string' && Date.now() - cachedAt < WEB_VERSION_CACHE_TTL_MS) {
+    return cachedCurrentVersion;
+  }
   if (inFlight) return inFlight;
-  // Within the backoff window after a recent failure, return null instantly without a network call so
+  // Within the backoff window after a recent failure, answer instantly without a network call so
   // a firewalled/offline host doesn't re-stall on every status poll / session start.
-  if (lastFailureAt && Date.now() - lastFailureAt < FAILURE_BACKOFF_MS) return null;
+  if (lastFailureAt && Date.now() - lastFailureAt < FAILURE_BACKOFF_MS) return cachedCurrentVersion ?? null;
   inFlight = (async (): Promise<string | null> => {
     try {
       const controller = new AbortController();
@@ -126,16 +135,17 @@ export async function resolveCurrentWebVersion(fetcher: typeof fetch = fetch): P
         const picked = pickSettledWebVersion(json.versions, Date.now(), rawCurrent);
         if (picked) {
           cachedCurrentVersion = picked; // cache only on success
+          cachedAt = Date.now();
           return picked;
         }
         lastFailureAt = Date.now(); // nothing usable — back off, then retry
-        return null;
+        return cachedCurrentVersion ?? null;
       } finally {
         clearTimeout(timer);
       }
     } catch {
       lastFailureAt = Date.now(); // fetch failed — back off, then retry
-      return null;
+      return cachedCurrentVersion ?? null;
     } finally {
       inFlight = null;
     }
