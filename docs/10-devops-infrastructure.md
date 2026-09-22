@@ -153,8 +153,8 @@ services:
       # The env var is API_MASTER_KEY (not API_KEY_MASTER); never hardcode a key — set a
       # strong secret. Production refuses to boot with a placeholder/default.
       - API_MASTER_KEY=
-      # Without this, plugins fall back to ./plugins (outside the data volume) and are lost
-      # when the container is replaced. The shipped compose sets it for the same reason.
+      # Pins the plugin directory onto the data volume. This is also the default, so the setting is
+      # belt-and-braces — it keeps working if the volume is mounted somewhere else.
       - PLUGINS_DIR=/app/data/plugins
     volumes:
       - ./:/app
@@ -232,8 +232,8 @@ services:
       - REDIS_HOST=${REDIS_HOST}
       - REDIS_PORT=${REDIS_PORT}
       - API_MASTER_KEY=${API_MASTER_KEY}
-      # Without this, plugins fall back to ./plugins (outside the data volume) and are lost
-      # when the container is replaced. The shipped compose sets it for the same reason.
+      # Pins the plugin directory onto the data volume. This is also the default, so the setting is
+      # belt-and-braces — it keeps working if the volume is mounted somewhere else.
       - PLUGINS_DIR=/app/data/plugins
     volumes:
       # Session auth, the main (auth/audit) SQLite DB, media and plugins all live here — losing
@@ -265,12 +265,31 @@ volumes:
 
 > [!IMPORTANT]
 > **Keep `replicas: 1`.** OpenWA is a single-process application: live engine state lives in an
-> in-memory `Map` in `SessionService` (`src/modules/session/session.service.ts`). Multi-replica is
+> in-memory `Map` in `EngineRegistry` (`src/engine/engine-registry.service.ts`), written solely by
+> `SessionEngineLifecycle`. Multi-replica is
 > **not** a supported topology — running two replicas against a shared `SESSION_DATA_PATH` makes two
 > browsers write the same WhatsApp LocalAuth directory and **corrupts the session** (forced logout /
 > ban). Shared storage and sticky sessions do **not** make multi-replica safe. See
 > [13 - Horizontal Scaling Guide](./13-horizontal-scaling.md) for the `replicas: 1` stance and the
 > (unimplemented) session-claim design that would be required first.
+
+### Helm Chart (Kubernetes)
+
+The maintained way to deploy on Kubernetes is the Helm chart at `charts/openwa/`:
+
+```bash
+helm install openwa ./charts/openwa \
+  --set secretEnv.API_MASTER_KEY=$(openssl rand -base64 32)
+```
+
+It renders a single-replica StatefulSet (`replicaCount: 1` — the same constraint as
+the compose warning above) with a PVC for `/app/data`, the compose hardening mirrored
+(read-only rootfs, dropped capabilities, writable `emptyDir` at `/tmp`), and optional
+Ingress / PodDisruptionBudget / ServiceMonitor. Configuration goes through free-form
+`env` and `secretEnv` maps — any variable from `.env.example` works; see
+`charts/openwa/README.md` and the inline comments in `charts/openwa/values.yaml`.
+The k8s manifests in [13 - Horizontal Scaling Guide](./13-horizontal-scaling.md) are
+an illustrative design sketch; the chart is the authoritative artifact.
 
 ## 10.3 CI/CD Pipeline
 
