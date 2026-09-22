@@ -8,6 +8,7 @@ import {
   pickSettledWebVersion,
   resolveCurrentWebVersion,
   resolveWebVersionPin,
+  WEB_VERSION_CACHE_TTL_MS,
   WEB_VERSION_SETTLE_MS,
 } from './wa-web-version';
 
@@ -124,6 +125,42 @@ describe('resolveCurrentWebVersion', () => {
   it('falls back to currentVersion when the registry carries no versions[]', async () => {
     const fetcher = jest.fn(() => Promise.resolve(json({ currentBeta: null, currentVersion: '2.3000.SOLO-alpha' })));
     await expect(resolveCurrentWebVersion(fetcher as never)).resolves.toBe('2.3000.SOLO-alpha');
+  });
+
+  describe('cache TTL', () => {
+    afterEach(() => jest.useRealTimers());
+
+    it('reuses a resolved build within the TTL and refreshes it once the TTL lapses', async () => {
+      jest.useFakeTimers({ now: new Date('2026-09-01T00:00:00Z'), doNotFake: ['setTimeout', 'clearTimeout'] });
+      const fetcher = jest
+        .fn()
+        .mockResolvedValueOnce(json({ currentVersion: '2.3000.OLD-alpha' }))
+        .mockResolvedValueOnce(json({ currentVersion: '2.3000.NEW-alpha' }));
+
+      await expect(resolveCurrentWebVersion(fetcher as never)).resolves.toBe('2.3000.OLD-alpha');
+      jest.setSystemTime(Date.now() + WEB_VERSION_CACHE_TTL_MS - 1);
+      await expect(resolveCurrentWebVersion(fetcher as never)).resolves.toBe('2.3000.OLD-alpha');
+      expect(fetcher).toHaveBeenCalledTimes(1);
+
+      jest.setSystemTime(Date.now() + 2);
+      await expect(resolveCurrentWebVersion(fetcher as never)).resolves.toBe('2.3000.NEW-alpha');
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps serving the last good build when a refresh fails', async () => {
+      jest.useFakeTimers({ now: new Date('2026-09-01T00:00:00Z'), doNotFake: ['setTimeout', 'clearTimeout'] });
+      const fetcher = jest
+        .fn()
+        .mockResolvedValueOnce(json({ currentVersion: '2.3000.OLD-alpha' }))
+        .mockRejectedValueOnce(new Error('offline'));
+
+      await expect(resolveCurrentWebVersion(fetcher as never)).resolves.toBe('2.3000.OLD-alpha');
+      jest.setSystemTime(Date.now() + WEB_VERSION_CACHE_TTL_MS + 1);
+      await expect(resolveCurrentWebVersion(fetcher as never)).resolves.toBe('2.3000.OLD-alpha');
+      // Within the failure backoff: no new fetch, still the last good build.
+      await expect(resolveCurrentWebVersion(fetcher as never)).resolves.toBe('2.3000.OLD-alpha');
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    });
   });
 });
 
