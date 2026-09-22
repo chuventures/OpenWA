@@ -2559,7 +2559,7 @@
     },
     "/api/infra/status": {
       "get": {
-        "operationId": "InfraController_getStatus",
+        "operationId": "InfraStatusController_getStatus",
         "parameters": [],
         "responses": {
           "200": {
@@ -2574,7 +2574,7 @@
     },
     "/api/infra/engines": {
       "get": {
-        "operationId": "InfraController_getEngines",
+        "operationId": "InfraStatusController_getEngines",
         "parameters": [],
         "responses": {
           "200": {
@@ -2589,7 +2589,7 @@
     },
     "/api/infra/engines/current": {
       "get": {
-        "operationId": "InfraController_getCurrentEngine",
+        "operationId": "InfraStatusController_getCurrentEngine",
         "parameters": [],
         "responses": {
           "200": {
@@ -2602,9 +2602,25 @@
         ]
       }
     },
+    "/api/infra/health": {
+      "get": {
+        "operationId": "InfraStatusController_healthCheck",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Server is healthy"
+          }
+        },
+        "summary": "Health check endpoint",
+        "tags": [
+          "infrastructure"
+        ],
+        "security": []
+      }
+    },
     "/api/infra/config": {
       "get": {
-        "operationId": "InfraController_getConfig",
+        "operationId": "InfraConfigController_getConfig",
         "parameters": [],
         "responses": {
           "200": {
@@ -2617,7 +2633,7 @@
         ]
       },
       "put": {
-        "operationId": "InfraController_saveConfig",
+        "operationId": "InfraConfigController_saveConfig",
         "parameters": [],
         "requestBody": {
           "required": true,
@@ -2643,7 +2659,7 @@
     },
     "/api/infra/restart": {
       "post": {
-        "operationId": "InfraController_requestRestart",
+        "operationId": "InfraConfigController_requestRestart",
         "parameters": [],
         "requestBody": {
           "required": false,
@@ -2666,25 +2682,9 @@
         ]
       }
     },
-    "/api/infra/health": {
-      "get": {
-        "operationId": "InfraController_healthCheck",
-        "parameters": [],
-        "responses": {
-          "200": {
-            "description": "Server is healthy"
-          }
-        },
-        "summary": "Health check endpoint",
-        "tags": [
-          "infrastructure"
-        ],
-        "security": []
-      }
-    },
     "/api/infra/export-data": {
       "get": {
-        "operationId": "InfraController_exportData",
+        "operationId": "InfraDataController_exportData",
         "parameters": [],
         "responses": {
           "200": {
@@ -2699,7 +2699,7 @@
     },
     "/api/infra/import-data": {
       "post": {
-        "operationId": "InfraController_importData",
+        "operationId": "InfraDataController_importData",
         "parameters": [],
         "requestBody": {
           "required": true,
@@ -2758,7 +2758,7 @@
     },
     "/api/infra/storage/files/count": {
       "get": {
-        "operationId": "InfraController_getStorageFileCount",
+        "operationId": "InfraStorageController_getStorageFileCount",
         "parameters": [],
         "responses": {
           "200": {
@@ -2773,7 +2773,7 @@
     },
     "/api/infra/storage/export": {
       "get": {
-        "operationId": "InfraController_exportStorage",
+        "operationId": "InfraStorageController_exportStorage",
         "parameters": [],
         "responses": {
           "200": {
@@ -2788,7 +2788,7 @@
     },
     "/api/infra/storage/import": {
       "post": {
-        "operationId": "InfraController_importStorage",
+        "operationId": "InfraStorageController_importStorage",
         "parameters": [],
         "requestBody": {
           "required": true,
@@ -4552,10 +4552,10 @@
         ],
         "responses": {
           "501": {
-            "description": "Not supported: neither engine implements catalog reads."
+            "description": "Not supported by the active engine: whatsapp-web.js has no catalog API."
           }
         },
-        "summary": "Get business catalog info (not implemented by any engine)",
+        "summary": "Get business catalog info (Baileys engine only)",
         "tags": [
           "catalog"
         ]
@@ -4598,10 +4598,10 @@
         ],
         "responses": {
           "501": {
-            "description": "Not supported: neither engine implements catalog reads."
+            "description": "Not supported by the active engine: whatsapp-web.js has no catalog API."
           }
         },
-        "summary": "List catalog products (not implemented by any engine)",
+        "summary": "List catalog products (Baileys engine only)",
         "tags": [
           "catalog"
         ]
@@ -4630,10 +4630,10 @@
         ],
         "responses": {
           "501": {
-            "description": "Not supported: neither engine implements catalog reads."
+            "description": "Not supported by the active engine: whatsapp-web.js has no catalog API."
           }
         },
-        "summary": "Get a specific product (not implemented by any engine)",
+        "summary": "Get a specific product (Baileys engine only)",
         "tags": [
           "catalog"
         ]
@@ -4663,11 +4663,17 @@
           }
         },
         "responses": {
+          "400": {
+            "description": "Product has no image — a product card requires one."
+          },
+          "404": {
+            "description": "Product id not found in the session catalog."
+          },
           "501": {
-            "description": "Not supported by the active engine: no engine can send product messages."
+            "description": "Not supported by the active engine: whatsapp-web.js cannot send product messages."
           }
         },
-        "summary": "Send a product message (not supported by any engine)",
+        "summary": "Send a product message (Baileys engine only)",
         "tags": [
           "catalog"
         ]
@@ -5877,7 +5883,7 @@
   "info": {
     "title": "OpenWA API",
     "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API",
-    "version": "0.12.1",
+    "version": "0.13.0",
     "contact": {
       "name": "OpenWA",
       "url": "https://github.com/rmyndharis/OpenWA",

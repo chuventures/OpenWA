@@ -111,9 +111,11 @@ jobs:
             exit 0
           fi
 
-          BODY='Automated sync from `rmyndharis/OpenWA:main`.
-
-Merging this PR into `main` triggers **Deploy to CapRover**.'
+          # Keep every line of this block indented: a line at column 0 ends the YAML `run: |` scalar
+          # and GitHub rejects the whole workflow file (it never ran from 2026-07-21 to 2026-09-22).
+          BODY=$(printf '%s\n\n%s' \
+            'Automated sync from `rmyndharis/OpenWA:main`.' \
+            'Merging this PR into `main` triggers **Deploy to CapRover**. whatsapp-web.js: back up `/app/data/sessions` before merging a release that bumps the browser.')
 
           if PR_URL=$(gh pr create \
             --repo "$GITHUB_REPOSITORY" \
@@ -136,8 +138,10 @@ Merging this PR into `main` triggers **Deploy to CapRover**.'
           echo "Failed to create or find an upstream synchronization PR."
           exit 1
 
+      # Off unless the repo variable UPSTREAM_AUTO_MERGE is "true": merging deploys to production, so
+      # by default the sync only opens the PR and a person merges it.
       - name: Merge sync PR (triggers CapRover deploy)
-        if: steps.upstream.outputs.commits_behind != '0' && steps.pr.outputs.pr_number != ''
+        if: vars.UPSTREAM_AUTO_MERGE == 'true' && steps.upstream.outputs.commits_behind != '0' && steps.pr.outputs.pr_number != ''
         env:
           GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         shell: bash

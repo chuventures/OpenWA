@@ -112,10 +112,13 @@ COPY package*.json ./
 # scripts/postinstall.js rides along: `npm ci` below runs the hook, which fails
 # when the file is missing. With the patcher present the hook applies it in
 # --best-effort mode; the explicit fatal run right after is the real gate.
-COPY scripts/postinstall.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch ./scripts/
+COPY scripts/postinstall.js scripts/patch-wwebjs-201832.js scripts/wwebjs-201832.patch scripts/patch-wwebjs-newsletter-preview.js ./scripts/
 
-# Install production dependencies only, then apply the backport patcher (needs `patch`).
-RUN npm ci --omit=dev && node scripts/patch-wwebjs-201832.js && npm cache clean --force
+# Install production dependencies only, then apply the backports.
+RUN npm ci --omit=dev \
+    && node scripts/patch-wwebjs-201832.js \
+    && node scripts/patch-wwebjs-newsletter-preview.js \
+    && npm cache clean --force
 
 # Replace the npm the base image bundles. npm is not on the request path — the entrypoint runs
 # `node dist/main` — but it stays in the image because the operator runbooks drive it
@@ -148,9 +151,13 @@ COPY --from=builder /app/dist ./dist
 # (app.module.ts resolves dashboard/dist relative to dist/). Single container, single port.
 COPY --from=builder /app/dashboard/dist ./dashboard/dist
 
-# Create data directories with correct ownership
-RUN mkdir -p ./data/sessions ./data/media && \
-    chown -R openwa:openwa /app
+# Create data directories with correct ownership. Only ./data is chowned, NOT all of /app: the app
+# tree (node_modules, dist) only needs read access, which root-owned files already grant, and the
+# entrypoint re-chowns /app/data at every container start for the mounted-volume case. A full
+# /app chown walks every production dependency file (issue #1045: ~35 minutes on a small VPS) and
+# duplicates their metadata into a new image layer.
+RUN mkdir -p ./data/sessions ./data/media ./data/plugins && \
+    chown -R openwa:openwa ./data
 
 # The non-root openwa user has no home of its own (`useradd -r`, no -m). Chromium resolves the home
 # dir from the passwd entry via glib's getpwuid() — it IGNORES $HOME — so it tries to read/write
