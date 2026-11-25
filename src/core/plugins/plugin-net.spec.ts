@@ -1,5 +1,7 @@
+import * as http from 'http';
+import type { AddressInfo } from 'net';
 import { effectiveNetAllow, isNetHostAllowed, performPluginFetch } from './plugin-net';
-import type { withSafeFetch } from '../../common/security/ssrf-guard';
+import { withSafeFetch } from '../../common/security/ssrf-guard';
 
 /** A stand-in for withSafeFetch that hands `use` a canned Response and records the init it was given. */
 function fakeSafeFetch(response: Response, sink: { init?: RequestInit }): typeof withSafeFetch {
@@ -88,6 +90,14 @@ describe('performPluginFetch', () => {
     expect(sink.init?.signal).toBeInstanceOf(AbortSignal);
   });
 
+  it.each([1.5, 0.4, 2500.9])('accepts a fractional timeoutMs of %s', async timeoutMs => {
+    // AbortSignal.timeout throws ERR_OUT_OF_RANGE for a non-integer, which failed the plugin's request.
+    const fetcher = fakeSafeFetch(cannedResponse('{}', {}), {});
+    await expect(
+      performPluginFetch('https://api.example.com/t', { timeoutMs }, { fetch: fetcher }),
+    ).resolves.toMatchObject({ ok: true });
+  });
+
   it('rejects a response whose declared content-length exceeds the cap', async () => {
     const sink: { init?: RequestInit } = {};
     const big = String(11 * 1024 * 1024);
@@ -122,14 +132,75 @@ describe('performPluginFetch', () => {
       performPluginFetch('https://api.example.com/t', {}, { fetch: fakeSafeFetch(cannedResponse('{}', {}), sink) }),
     ).resolves.toMatchObject({ ok: true });
   });
+
+  it('treats a null init as no options and never holds a concurrency slot for it', async () => {
+    // A sandboxed plugin can send `null` across the worker bridge; the `= {}` default only covers undefined.
+    const sink: { init?: RequestInit } = {};
+    const fetcher = fakeSafeFetch(cannedResponse('{}', {}), sink);
+    for (let i = 0; i < 17; i++) {
+      await expect(performPluginFetch('https://api.example.com/t', null, { fetch: fetcher })).resolves.toMatchObject({
+        ok: true,
+      });
+    }
+    expect(sink.init?.method).toBe('GET');
+  });
+
+  it('aborts a live local HTTP request when the external AbortSignal aborts', async () => {
+    let requestReceived!: () => void;
+    let serverClosed!: () => void;
+    const onRequestReceived = new Promise<void>(resolve => (requestReceived = resolve));
+    const onServerClosed = new Promise<void>(resolve => (serverClosed = resolve));
+
+    const server = http.createServer(req => {
+      requestReceived();
+      req.on('close', () => serverClosed());
+      // Intentionally hang without writing headers so only abort terminates the request.
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    const controller = new AbortController();
+
+    try {
+      const fetchPromise = performPluginFetch(
+        `http://127.0.0.1:${port}/hang`,
+        { timeoutMs: 30_000 },
+        {
+          fetch: (url, init, use) => withSafeFetch(url, init, use, { guard: false }),
+          signal: controller.signal,
+        },
+      );
+
+      await onRequestReceived;
+      controller.abort(new Error('capability timed out'));
+
+      await expect(fetchPromise).rejects.toThrow();
+      await onServerClosed;
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
 });
 
 describe('effectiveNetAllow', () => {
-  it('adds the host of each named config URL to the static allowlist', () => {
+  it('adds the https origin of each named config URL to the static allowlist', () => {
     expect(effectiveNetAllow(['api.static.com'], ['baseUrl'], { baseUrl: 'https://chat.acme.com' })).toEqual([
       'api.static.com',
-      'chat.acme.com',
+      'https://chat.acme.com:443',
     ]);
+  });
+  it('grants a config host over https on its configured port only', () => {
+    const allow = effectiveNetAllow([], ['baseUrl'], { baseUrl: 'https://chat.example.com' });
+    expect(isNetHostAllowed(allow, 'https://chat.example.com/api')).toBe(true);
+    expect(isNetHostAllowed(allow, 'https://chat.example.com:443/api')).toBe(true);
+    expect(isNetHostAllowed(allow, 'http://chat.example.com/')).toBe(false);
+    expect(isNetHostAllowed(allow, 'http://chat.example.com:6379/')).toBe(false);
+    expect(isNetHostAllowed(allow, 'https://chat.example.com:6379/')).toBe(false);
+
+    const withPort = effectiveNetAllow([], ['baseUrl'], { baseUrl: 'https://host.com:8443' });
+    expect(isNetHostAllowed(withPort, 'https://host.com:8443/x')).toBe(true);
+    expect(isNetHostAllowed(withPort, 'https://host.com/x')).toBe(false);
+    expect(isNetHostAllowed(withPort, 'http://host.com:8443/x')).toBe(false);
   });
   it('ignores missing / non-string / non-https / credentialed config values', () => {
     expect(effectiveNetAllow([], ['baseUrl'], {})).toEqual([]);
@@ -142,6 +213,6 @@ describe('effectiveNetAllow', () => {
     expect(effectiveNetAllow([], ['baseUrl'], { baseUrl: 'https://*' })).toEqual([]); // bare '*' would open all hosts
     expect(effectiveNetAllow([], ['baseUrl'], { baseUrl: 'https://%2A' })).toEqual([]); // encoded '*' too
     expect(effectiveNetAllow([], ['baseUrl'], { baseUrl: 'https://*:443/x' })).toEqual([]);
-    expect(effectiveNetAllow([], ['baseUrl'], { baseUrl: 'https://host.com:8443' })).toEqual(['host.com:8443']);
+    expect(effectiveNetAllow([], ['baseUrl'], { baseUrl: 'https://host.com:8443' })).toEqual(['https://host.com:8443']);
   });
 });

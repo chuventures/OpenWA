@@ -27,7 +27,7 @@ class ProfileResource
      */
     public function setProfileName(string $sessionId, string $name): array
     {
-        return $this->http->request('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/profile/name", [], ['name' => $name]);
+        return $this->http->requestArray('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/profile/name", [], ['name' => $name]);
     }
 
     /**
@@ -38,7 +38,7 @@ class ProfileResource
      */
     public function setProfileStatus(string $sessionId, string $status): array
     {
-        return $this->http->request('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/profile/status", [], ['status' => $status]);
+        return $this->http->requestArray('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/profile/status", [], ['status' => $status]);
     }
 
     /**
@@ -50,6 +50,16 @@ class ProfileResource
      */
     public function setProfilePicture(string $sessionId, array $body): array
     {
-        return $this->http->request('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/profile/picture", [], $body);
+        return $this->http->requestArray('PUT', "/api/sessions/{$this->http->encodeSegment($sessionId)}/profile/picture", [], $body);
+    }
+
+    /**
+     * Remove the account profile picture. Requires an OPERATOR-level key.
+     *
+     * @return array<string,mixed>
+     */
+    public function deleteProfilePicture(string $sessionId): array
+    {
+        return $this->http->requestArray('DELETE', "/api/sessions/{$this->http->encodeSegment($sessionId)}/profile/picture");
     }
 }

@@ -1,9 +1,10 @@
 import { Column, Entity, Index, PrimaryGeneratedColumn } from 'typeorm';
 import { bigintToNumberTransformer } from '../../message/entities/message.entity';
+import { NulFreeTransformer } from '../../../common/transformers/nul-free.transformer';
 
 @Entity('status_updates')
-@Index(['sessionId', 'contactJid'])
-@Index(['sessionId', 'waStatusId'], { unique: true })
+@Index('IDX_status_updates_sessionId_contactJid', ['sessionId', 'contactJid'])
+@Index('UQ_status_updates_sessionId_waStatusId', ['sessionId', 'waStatusId'], { unique: true })
 export class StatusUpdate {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
@@ -15,10 +16,10 @@ export class StatusUpdate {
   @Column()
   contactJid!: string;
 
-  @Column({ nullable: true })
+  @Column({ nullable: true, transformer: NulFreeTransformer })
   contactName?: string;
 
-  @Column({ nullable: true })
+  @Column({ nullable: true, transformer: NulFreeTransformer })
   contactPushName?: string;
 
   /** Engine status id, e.g. false_status@broadcast_<hash>. */
@@ -26,16 +27,21 @@ export class StatusUpdate {
   waStatusId!: string;
 
   @Column()
-  type!: 'text' | 'image' | 'video';
+  type!: 'text' | 'image' | 'video' | 'voice';
 
-  @Column({ type: 'text', nullable: true })
+  @Column({ type: 'text', nullable: true, transformer: NulFreeTransformer })
   caption?: string;
 
-  /** Relative path under the media store; null for text or omitted media. */
+  /**
+   * Relative path under the media store; null for text or omitted media. The partial index serves the orphan
+   * sweep's per-chunk `mediaPath IN (...)` lookup; the name matches the migration that creates it, and the
+   * column is quoted in the predicate for the reason given on `Message.mediaPath`.
+   */
+  @Index('IDX_status_updates_mediaPath', { where: '"mediaPath" IS NOT NULL' })
   @Column({ nullable: true })
   mediaPath?: string;
 
-  @Column({ nullable: true })
+  @Column({ nullable: true, transformer: NulFreeTransformer })
   mediaMimetype?: string;
 
   @Column({ default: false })
@@ -55,6 +61,6 @@ export class StatusUpdate {
   postedAt!: number; // epoch ms
 
   @Column({ type: 'bigint', transformer: bigintToNumberTransformer })
-  @Index()
+  @Index('IDX_status_updates_expiresAt')
   expiresAt!: number; // epoch ms
 }

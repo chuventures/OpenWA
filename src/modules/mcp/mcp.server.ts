@@ -1,20 +1,36 @@
-import { ForbiddenException, HttpException, Logger, UnauthorizedException } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+import { ForbiddenException, HttpException, UnauthorizedException } from '@nestjs/common';
+import { createLogger } from '../../common/services/logger.service';
+import { getRequestId, runWithRequestId, setRequestActor } from '../../common/services/request-context';
 import type { HttpAdapterHost } from '@nestjs/core';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { AnySchema } from '@modelcontextprotocol/sdk/server/zod-compat.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
+import type { ChatScopeService } from '../auth/chat-scope.service';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
-import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
+import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
 import express, { type Request, type RequestHandler, type Response } from 'express';
 import { invokeTool } from '../../core/agent-tools/tool-invoker';
 import type { ToolRegistryService } from '../../core/agent-tools/tool-registry.service';
-import type { AuthService } from '../auth/auth.service';
+import { UnresolvedApiKeyException, type AuthService } from '../auth/auth.service';
+import { allowUnauthenticatedAuditRow } from '../audit/auth-failure-audit-limiter';
 import type { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
-import { handleToolError, jsonToolResult, smartToolResult } from './tool-result';
-import type { KeyRateLimiter } from './mcp-rate-limit';
-import { resolveClientIp } from '../../common/utils/ip';
+import {
+  capToolError,
+  DEFAULT_MCP_MAX_RESULT_BYTES,
+  handleToolError,
+  readMaxResultBytes,
+  smartToolResult,
+} from './tool-result';
+import { deriveToolTitle } from './tool-title';
+import { KeyRateLimiter, readRateLimitConfig } from './mcp-rate-limit';
+import { limiterKeyForIp, parseTrustedProxies, resolveClientIp } from '../../common/utils/ip';
+import { resolveBodyLimit } from '../../config/bootstrap-security';
+import { presentedApiKey } from '../../common/security/bearer-token';
 
-const logger = new Logger('McpServer');
+const logger = createLogger('McpServer');
 
 type HttpAdapter = NonNullable<HttpAdapterHost['httpAdapter']>;
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
@@ -26,19 +42,13 @@ export interface McpRequestContext {
   path?: string;
 }
 
-/** Extract the raw API key from MCP request headers. Accepts X-Api-Key or Bearer token. */
-function extractApiKey(extra: ToolExtra): string | undefined {
-  const headers = extra.requestInfo?.headers ?? {};
-  const xApiKey = headers['x-api-key'];
-  if (xApiKey) {
-    return Array.isArray(xApiKey) ? xApiKey[0] : xApiKey;
-  }
-  const auth = headers['authorization'];
-  const authStr = Array.isArray(auth) ? auth[0] : auth;
-  if (authStr?.toLowerCase().startsWith('bearer ')) {
-    return authStr.slice(7).trim();
-  }
-  return undefined;
+/**
+ * Extract the raw API key from request headers. Accepts X-Api-Key or Bearer token. The mount gate parses
+ * the Express headers and hands the key it validated to the per-tool check as `authInfo`, so the two
+ * cannot disagree on what the credential is (the SDK's own header copy joins duplicate headers).
+ */
+function extractApiKey(headers: Record<string, string | string[] | undefined> = {}): string | undefined {
+  return presentedApiKey(headers);
 }
 
 /**
@@ -46,7 +56,9 @@ function extractApiKey(extra: ToolExtra): string | undefined {
  * the Nest guard pipeline), so without this a credential-probing flood against /mcp leaves no forensic
  * record. Records a WARN `API_KEY_AUTH_FAILED` for rejected/denied authentication attempts (401/403 only);
  * non-auth errors (e.g. a 400 from bad tool input) are NOT audited — parity with the REST guard, which
- * only records Unauthorized/Forbidden. Fire-and-forget; best-effort (AuditService swallows insert errors).
+ * only records Unauthorized/Forbidden. A rejection that names no stored key (UnresolvedApiKeyException)
+ * draws on the per-IP budget the REST guard and Bull Board share; a stored key's rejection is always
+ * recorded. Fire-and-forget; best-effort (AuditService swallows insert errors).
  */
 export function auditMcpAuthFailure(
   auditService: Pick<AuditService, 'logWarn'> | undefined,
@@ -54,6 +66,9 @@ export function auditMcpAuthFailure(
   reqContext: McpRequestContext,
 ): void {
   if (!auditService) return;
+  if (error instanceof UnresolvedApiKeyException && !allowUnauthenticatedAuditRow(reqContext.ipAddress ?? '')) {
+    return;
+  }
   if (error instanceof UnauthorizedException || error instanceof ForbiddenException) {
     void auditService.logWarn(AuditAction.API_KEY_AUTH_FAILED, {
       ipAddress: reqContext.ipAddress,
@@ -66,10 +81,7 @@ export function auditMcpAuthFailure(
 
 /** Read TRUSTED_PROXIES once as a list (shared by the pre-auth throttle and the audit IP resolver). */
 function readTrustedProxies(): string[] {
-  return (process.env.TRUSTED_PROXIES ?? '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
+  return parseTrustedProxies(process.env.TRUSTED_PROXIES);
 }
 
 /** Resolve the trusted-proxy-aware client IP + HTTP method/path for an audit record. */
@@ -79,6 +91,43 @@ function resolveReqContext(req: Request): McpRequestContext {
     method: req.method,
     path: req.path,
   };
+}
+
+/** Run `fn` inside a request context with the resolved client IP stamped for downstream audit rows. */
+function runWithMcpActor<T>(ipAddress: string | undefined, fn: () => T): T {
+  const execute = (): T => {
+    setRequestActor({ ipAddress });
+    return fn();
+  };
+  return getRequestId() ? execute() : runWithRequestId(randomUUID(), execute);
+}
+
+/** Count JSON-RPC messages in a parsed request body (batches charge once per element). */
+function jsonRpcMessageCount(body: unknown): number {
+  return Array.isArray(body) ? Math.max(1, body.length) : 1;
+}
+
+/**
+ * The most array items and object keys, nested ones included, a tool call may carry. The SDK counts them before
+ * it validates, so a call past it is refused at once; below it, one wrong value in a `vars` map costs one issue
+ * line per entry, and a map of tens of thousands answered with megabytes. REST bounds a body the same way
+ * (docs/04). The widest input a tool takes is a list of a few hundred ids.
+ */
+export const MCP_MAX_TOOL_INPUT_ELEMENTS = 10_000;
+
+/**
+ * Put the answers the SDK writes itself under the result cap. It refuses a call whose arguments its schema
+ * rejects before the tool's callback runs, in a text that names each invalid value, so one wide argument (up to
+ * {@link MCP_MAX_TOOL_INPUT_ELEMENTS} elements) makes an answer of several hundred kilobytes.
+ *
+ * `createToolError` is private to the SDK, hence the cast; `sdk-error-cap.spec.ts` runs the real class, so a
+ * release that renames the method fails there instead of leaving these answers uncut.
+ */
+export function capSdkErrors(server: McpServer, maxResultBytes: number): void {
+  const sdk = server as unknown as { createToolError?: (message: string) => CallToolResult };
+  const createToolError = sdk.createToolError;
+  if (maxResultBytes <= 0 || typeof createToolError !== 'function') return;
+  sdk.createToolError = message => capToolError(createToolError.call(server, message), maxResultBytes);
 }
 
 /**
@@ -94,20 +143,27 @@ function buildServer(
   serverInfo: { name: string; version: string },
   auditService: AuditService | undefined,
   reqContext: McpRequestContext,
+  chatScope?: ChatScopeService,
+  maxResultBytes = DEFAULT_MCP_MAX_RESULT_BYTES,
 ): McpServer {
   const server = new McpServer(
     { name: serverInfo.name, version: serverInfo.version },
-    { capabilities: { tools: {}, logging: {} } },
+    { capabilities: { tools: {}, logging: {} }, maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS },
   );
+
+  capSdkErrors(server, maxResultBytes);
 
   const tools = registry.list({ readOnly });
   for (const tool of tools) {
     server.registerTool(
       tool.name,
       {
+        title: tool.title ?? deriveToolTitle(tool.name),
         description: tool.description,
-        // inputSchema accepts AnySchema (zod v4 $ZodType is compatible)
-        inputSchema: tool.inputSchema as Parameters<typeof server.registerTool>[1]['inputSchema'],
+        // The SDK's InputArgs is inferred from this property. Widening it to the whole
+        // `ZodRawShapeCompat | AnySchema` constraint would collapse the callback type it derives, so
+        // the cast names AnySchema exactly — which zod v4's $ZodType satisfies.
+        inputSchema: tool.inputSchema as AnySchema,
         annotations: {
           readOnlyHint: tool.tier === 'read',
           destructiveHint: tool.destructive ?? false,
@@ -115,31 +171,34 @@ function buildServer(
         },
       },
       async (input: Record<string, unknown>, extra: ToolExtra) => {
-        const rawKey = extractApiKey(extra);
-        try {
-          const result = await invokeTool(
-            tool,
-            input,
-            rawKey,
-            authService,
-            id => rateLimiter.check(id),
-            // onAuthFailure: mirror the REST ApiKeyGuard — record rejected/denied auth attempts (401/403
-            // only) at the auth boundary so the audit trail covers MCP credential probing. Fires inside
-            // invokeTool's auth phase (before the tool handler), so handler-thrown 403s are NOT mislabeled
-            // as auth failures. Best-effort; success and non-auth errors skip this.
-            error => auditMcpAuthFailure(auditService, error, reqContext),
-          );
-          return tool.resultDisposition === 'json'
-            ? jsonToolResult(result as object)
-            : smartToolResult(result as object);
-        } catch (error) {
-          return handleToolError(error);
-        }
+        const rawKey = extra.authInfo?.token ?? extractApiKey(extra.requestInfo?.headers);
+        return runWithMcpActor(reqContext.ipAddress, async () => {
+          try {
+            const result = await invokeTool(
+              tool,
+              input,
+              rawKey,
+              authService,
+              id => rateLimiter.check(id),
+              // onAuthFailure: mirror the REST ApiKeyGuard — record rejected/denied auth attempts (401/403
+              // only) at the auth boundary so the audit trail covers MCP credential probing. Fires inside
+              // invokeTool's authorization checks (before the tool handler), so handler-thrown 403s are NOT mislabeled
+              // as auth failures. Best-effort; success and non-auth errors skip this.
+              error => auditMcpAuthFailure(auditService, error, reqContext),
+              chatScope,
+              extra.signal,
+            );
+            return smartToolResult(result as object, maxResultBytes, {
+              untrustedContent: tool.returnsUntrustedContent === true,
+            });
+          } catch (error) {
+            return capToolError(handleToolError(error), maxResultBytes);
+          }
+        });
       },
     );
   }
 
-  logger.log(`MCP server built with ${tools.length} tools (readOnly=${readOnly})`);
   return server;
 }
 
@@ -147,6 +206,12 @@ export interface MountMcpServerOptions {
   basePath?: string;
   serverInfo?: { name: string; version: string };
   readOnly?: boolean;
+  /**
+   * A cap on a tool result, in UTF-8 bytes: with one set, every result is text, cut at the cap, and none is
+   * offloaded as a blob. Defaults to `readMaxResultBytes()` (100000 when `MCP_MAX_RESULT_BYTES` is unset);
+   * pass `0` explicitly to disable the cap and restore base64 resource offloading.
+   */
+  maxResultBytes?: number;
 }
 
 /**
@@ -154,8 +219,9 @@ export interface MountMcpServerOptions {
  * at `POST {basePath}` (default `/mcp`), single-port.
  *
  * Tool handlers are built ONCE at mount time (closure over registry/authService/rateLimiter).
+ * Every POST passes the per-IP throttle and then the key gate before any MCP method runs.
  * Per-request: mint a fresh McpServer + StreamableHTTPServerTransport, handle, tear down.
- * Stateless (sessionIdGenerator: undefined) — no session map, no GET/DELETE reconnect.
+ * Stateless (sessionIdGenerator: undefined): no session map; GET/DELETE answer 405.
  * Creating a new McpServer per request is safe and avoids the single-transport constraint;
  * tool registration is O(n) pure function calls with no I/O overhead.
  */
@@ -167,9 +233,14 @@ export interface MountMcpServerOptions {
  */
 export function createIpThrottle(ipRateLimiter: KeyRateLimiter): RequestHandler {
   return (req, res, next) => {
-    const ip = resolveClientIp(req, readTrustedProxies());
+    const ip = limiterKeyForIp(resolveClientIp(req, readTrustedProxies()));
+    // The unit of work is the JSON-RPC message, not the HTTP request: the transport dispatches every
+    // element of a batch, and each tools/call element runs its own key lookup and auth-failure audit.
+    // An over-budget batch throws on the first check past the cap, so a huge array costs at most
+    // `max + 1` checks.
+    const messages = jsonRpcMessageCount(req.body);
     try {
-      ipRateLimiter.check(ip);
+      for (let i = 0; i < messages; i++) ipRateLimiter.check(ip);
       next();
     } catch (err) {
       const status = err instanceof HttpException ? err.getStatus() : 429;
@@ -179,6 +250,49 @@ export function createIpThrottle(ipRateLimiter: KeyRateLimiter): RequestHandler 
         id: null,
       });
     }
+  };
+}
+
+/**
+ * Mount gate: every POST must carry a valid API key before the transport answers anything, including
+ * `initialize` (server version) and `tools/list` (tool catalogue). Runs after the per-IP throttle so a
+ * flood never reaches the key lookup. Validated with no client IP and no session, as the per-tool check
+ * does: a key with `allowedIps` is refused on MCP, and role, session and chat scope stay per tool call.
+ * Charges an optional per-key pre-dispatch envelope limiter once per JSON-RPC message to cap non-tool
+ * and invalid-schema floods across IPs before transport/Zod parsing, while invokeTool keeps enforcing
+ * the tool-call limiter with in-band responses.
+ */
+export function createKeyGate(
+  authService: Pick<AuthService, 'validateApiKey'>,
+  auditService: Pick<AuditService, 'logWarn'> | undefined,
+  gateRateLimiter?: KeyRateLimiter,
+): RequestHandler {
+  return async (req, res, next) => {
+    const reqContext = resolveReqContext(req);
+    setRequestActor({ ipAddress: reqContext.ipAddress });
+    try {
+      const rawKey = extractApiKey(req.headers);
+      if (!rawKey) throw new UnresolvedApiKeyException('Missing API key');
+      const apiKey = await authService.validateApiKey(rawKey, undefined, undefined, { recordUsage: false });
+      if (gateRateLimiter) {
+        const messages = jsonRpcMessageCount(req.body);
+        for (let i = 0; i < messages; i++) gateRateLimiter.check(apiKey.id);
+      }
+      // The transport forwards req.auth to every tool call as extra.authInfo.
+      (req as Request & { auth?: AuthInfo }).auth = { token: rawKey, clientId: 'api-key', scopes: [] };
+    } catch (err) {
+      if (err instanceof HttpException) {
+        runWithMcpActor(reqContext.ipAddress, () => auditMcpAuthFailure(auditService, err, reqContext));
+        const status = err.getStatus();
+        if (status === 401) res.set('WWW-Authenticate', 'Bearer');
+        res.status(status).json({ jsonrpc: '2.0', error: { code: -32000, message: err.message }, id: null });
+        return;
+      }
+      logger.error('Error authenticating MCP request', err instanceof Error ? err.stack : String(err));
+      res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null });
+      return;
+    }
+    next();
   };
 }
 
@@ -200,18 +314,24 @@ export function mountMcpServer(
   ipRateLimiter: KeyRateLimiter,
   options: MountMcpServerOptions = {},
   auditService?: AuditService,
+  chatScope?: ChatScopeService,
 ): void {
   const basePath = (options.basePath ?? '/mcp').replace(/\/$/, '') || '/mcp';
   const serverInfo = options.serverInfo ?? { name: 'openwa', version: '0.0.0' };
   const readOnly = resolveMcpReadOnly(options.readOnly);
+  const maxResultBytes = options.maxResultBytes ?? readMaxResultBytes();
 
   // Eagerly compute the tool list at mount time to validate the registry is populated
   // and to emit the log line once. The actual McpServer is re-created per request to
   // avoid the SDK's single-transport-at-a-time constraint under concurrent load.
   const tools = registry.list({ readOnly });
-  logger.log(`MCP server mounted at POST ${basePath} (${tools.length} tools)`);
+  logger.log(`MCP server mounted at POST ${basePath} (${tools.length} tools, readOnly=${readOnly})`);
+
+  const rateLimitConfig = readRateLimitConfig();
+  const gateRateLimiter = new KeyRateLimiter(rateLimitConfig.max * 2, rateLimitConfig.windowMs);
 
   const handler: RequestHandler = async (req: Request, res: Response) => {
+    const reqContext = resolveReqContext(req);
     const server = buildServer(
       registry,
       authService,
@@ -219,7 +339,9 @@ export function mountMcpServer(
       readOnly,
       serverInfo,
       auditService,
-      resolveReqContext(req),
+      reqContext,
+      chatScope,
+      maxResultBytes,
     );
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     try {
@@ -227,8 +349,10 @@ export function mountMcpServer(
         void transport.close();
         void server.close();
       });
-      await server.connect(transport);
-      await transport.handleRequest(req, res, req.body);
+      await runWithMcpActor(reqContext.ipAddress, async () => {
+        await server.connect(transport);
+        await transport.handleRequest(req, res, req.body);
+      });
     } catch (error) {
       logger.error('Error handling MCP request', error instanceof Error ? error.stack : String(error));
       if (!res.headersSent) {
@@ -237,9 +361,35 @@ export function mountMcpServer(
     }
   };
 
-  const adapter = httpAdapter as unknown as { post: (path: string, ...handlers: RequestHandler[]) => unknown };
+  type Mount = (path: string, ...handlers: RequestHandler[]) => unknown;
+  const adapter = httpAdapter as unknown as { post: Mount; get: Mount; delete: Mount };
   // The route throttle gates the auth DB lookup and per-request MCP server/transport construction. The
-  // process-wide capped json() in main.ts runs first for all routes; this route-level parser is a
-  // defensive fallback and no-ops once the global parser has consumed the body.
-  adapter.post(basePath, createIpThrottle(ipRateLimiter), express.json(), handler);
+  // process-wide capped json() in src/configure-app.ts runs first for all routes; this route-level parser is a
+  // defensive fallback and no-ops once the global parser has consumed the body. It sits before the
+  // throttle so the throttle always sees a parsed body and can charge a batch per message.
+  // `inflate: false` matches the global parsers: a compressed body is refused by the budget
+  // middleware long before this runs, and this keeps the fallback from becoming the one parser that
+  // would still gunzip an unaccounted body if that ordering ever changed.
+  // `limit` mirrors the same global cap for the same reason: without it a middleware reorder would
+  // silently leave this mount uncapped.
+  const bodyLimit = resolveBodyLimit(process.env.BODY_SIZE_LIMIT);
+  adapter.post(
+    basePath,
+    express.json({ limit: bodyLimit, inflate: false }),
+    createIpThrottle(ipRateLimiter),
+    createKeyGate(authService, auditService, gateRateLimiter),
+    handler,
+  );
+  // Stateless transport: no standalone SSE stream and no session to delete. The Streamable HTTP spec
+  // requires a GET to be answered with a stream or 405, and SDK clients treat anything but 405 as an
+  // error on every connect. Routing these to the transport would open a stream (GET) or answer 200
+  // (DELETE), so they are refused here without touching auth or the DB.
+  const methodNotAllowed: RequestHandler = (_req, res) => {
+    res
+      .status(405)
+      .set('Allow', 'POST')
+      .json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed.' }, id: null });
+  };
+  adapter.get(basePath, methodNotAllowed);
+  adapter.delete(basePath, methodNotAllowed);
 }

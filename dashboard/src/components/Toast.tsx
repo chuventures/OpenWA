@@ -1,19 +1,8 @@
-import { createContext, useContext, useState, useCallback, type ReactNode } from 'react';
+import { useState, useCallback, useMemo, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { CheckCircle, XCircle, AlertCircle, Info, X } from 'lucide-react';
+import { ToastActionsContext, ToastContext, type Toast } from '../hooks/useToast';
 import './Toast.css';
-
-type ToastType = 'success' | 'error' | 'warning' | 'info';
-
-interface Toast {
-  id: string;
-  type: ToastType;
-  title: string;
-  message?: string;
-  duration?: number;
-  /** Stable, non-rendered key for de-duplicating recurring toasts. Independent of the (translated) title. */
-  dedupeKey?: string;
-}
 
 // A toast id needs no cryptographic strength; crypto.randomUUID is undefined over plain HTTP on a LAN IP.
 const createToastId = (): string => crypto.randomUUID?.() ?? `t-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -21,26 +10,6 @@ const createToastId = (): string => crypto.randomUUID?.() ?? `t-${Date.now()}-${
 // De-dupe sentinel for the "backend unreachable" toast. Kept separate from the displayed title so
 // translating the title never silently breaks the de-dupe.
 const CONNECTION_LOST_DEDUPE_KEY = 'connection-lost';
-
-interface ToastContextValue {
-  toasts: Toast[];
-  addToast: (toast: Omit<Toast, 'id'>) => void;
-  removeToast: (id: string) => void;
-  success: (title: string, message?: string) => void;
-  error: (title: string, message?: string) => void;
-  warning: (title: string, message?: string) => void;
-  info: (title: string, message?: string) => void;
-}
-
-const ToastContext = createContext<ToastContextValue | null>(null);
-
-export function useToast() {
-  const context = useContext(ToastContext);
-  if (!context) {
-    throw new Error('useToast must be used within a ToastProvider');
-  }
-  return context;
-}
 
 interface ToastProviderProps {
   children: ReactNode;
@@ -78,13 +47,21 @@ export function ToastProvider({ children }: ToastProviderProps) {
 
   const error = useCallback(
     (title: string, message?: string) => {
+      // Browser fetch rejections: Chromium 'Failed to fetch', Firefox 'NetworkError ...', WebKit exactly
+      // 'Load failed' (compared whole, so 'download failed ...' keeps its own toast). A proxy answering
+      // 502/503 with a non-JSON body surfaces as exactly 'HTTP <status>' (see handleErrorResponse). A 504
+      // keeps its own toast: the proxy reached the backend and stopped waiting, so the request (an import,
+      // a restart) may still be running and the caller's title says which one.
+      const m = message?.toLowerCase().trim() ?? '';
+      const tl = title.toLowerCase().trim();
       const isConnectionError =
-        message?.toLowerCase().includes('failed to fetch') ||
-        message?.toLowerCase().includes('networkerror') ||
-        message?.toLowerCase().includes('http 502') ||
-        message?.toLowerCase().includes('http 503') ||
-        title.toLowerCase().includes('failed to fetch') ||
-        title.toLowerCase().includes('networkerror');
+        m.includes('failed to fetch') ||
+        m.includes('networkerror') ||
+        m === 'load failed' ||
+        /^http 50[23]$/.test(m) ||
+        tl.includes('failed to fetch') ||
+        tl.includes('networkerror') ||
+        tl === 'load failed';
 
       if (isConnectionError) {
         // De-dupe on the stable key (not the translated title) so a downed backend shows one toast.
@@ -129,11 +106,19 @@ export function ToastProvider({ children }: ToastProviderProps) {
     [addToast],
   );
 
+  const actionsValue = useMemo(
+    () => ({ addToast, removeToast, success, error, warning, info }),
+    [addToast, removeToast, success, error, warning, info],
+  );
+  const value = useMemo(() => ({ toasts, ...actionsValue }), [toasts, actionsValue]);
+
   return (
-    <ToastContext.Provider value={{ toasts, addToast, removeToast, success, error, warning, info }}>
-      {children}
-      <ToastContainer toasts={toasts} removeToast={removeToast} />
-    </ToastContext.Provider>
+    <ToastActionsContext.Provider value={actionsValue}>
+      <ToastContext.Provider value={value}>
+        {children}
+        <ToastContainer toasts={toasts} removeToast={removeToast} />
+      </ToastContext.Provider>
+    </ToastActionsContext.Provider>
   );
 }
 

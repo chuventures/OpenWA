@@ -1,13 +1,14 @@
 import { BadRequestException } from '@nestjs/common';
 import { CallService } from './call.service';
-import { SessionService } from '../session/session.service';
+import { EngineRegistry } from '../../engine/engine-registry.service';
 import { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
 import { CallNotFoundError } from '../../common/errors/call-not-found.error';
 
 describe('CallService', () => {
   const makeService = (engine: Partial<IWhatsAppEngine> | undefined) => {
-    const sessionService = { getEngine: jest.fn().mockReturnValue(engine) } as unknown as SessionService;
-    return new CallService(sessionService);
+    const engines = new EngineRegistry();
+    if (engine) engines.set('s1', engine as IWhatsAppEngine);
+    return new CallService(engines);
   };
 
   it('throws 400 "Session is not started" when the engine is missing (guard preserved)', () => {
@@ -23,6 +24,19 @@ describe('CallService', () => {
     const svc = makeService({ rejectCall });
     await svc.rejectCall('s1', 'CALL1');
     expect(rejectCall).toHaveBeenCalledWith('CALL1');
+  });
+
+  it('delegates createCallLink to the engine with the type and epoch-ms startTime', async () => {
+    const createCallLink = jest.fn().mockResolvedValue('https://call.whatsapp.com/voice/L');
+    const svc = makeService({ createCallLink });
+    await expect(svc.createCallLink('s1', 'audio', 1_800_000_000_000)).resolves.toBe(
+      'https://call.whatsapp.com/voice/L',
+    );
+    expect(createCallLink).toHaveBeenCalledWith('audio', 1_800_000_000_000);
+  });
+
+  it('guards createCallLink with the same 400 when the engine is missing', () => {
+    expect(() => makeService(undefined).createCallLink('s1', 'video', 1)).toThrow('Session is not started');
   });
 
   it('propagates the engine not-found error (unknown/expired call id -> 404)', async () => {

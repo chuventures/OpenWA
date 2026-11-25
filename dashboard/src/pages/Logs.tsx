@@ -4,16 +4,19 @@ import { Download, Search, Filter, Loader2, FileText, AlertCircle } from 'lucide
 import type { AuditLog } from '../services/api';
 import { auditApi } from '../services/api';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
+import { useToast } from '../hooks/useToast';
 import { useLogsQuery } from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
 import { CustomSelect } from '../components/CustomSelect';
 import { pageWindow } from '../utils/pageWindow';
 import { fetchAllPages } from '../utils/fetchAllPages';
 import { escapeCsvCell } from '../utils/csv';
+import { scheduleObjectUrlRevoke } from '../utils/objectUrl';
 import './Logs.css';
 
 export function Logs() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const toast = useToast();
   useDocumentTitle(t('logs.title'));
   const [searchQuery, setSearchQuery] = useState('');
   const [severityFilter, setSeverityFilter] = useState('all');
@@ -26,14 +29,20 @@ export function Logs() {
   const logs: AuditLog[] = data?.data ?? [];
   const total: number = data?.total ?? 0;
 
-  const filteredLogs = logs.filter(log => {
-    const matchesSearch =
-      log.action.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (log.errorMessage || '').toLowerCase().includes(searchQuery.toLowerCase());
-    return matchesSearch;
-  });
+  // Trimmed once, so the table, its empty state and the export agree on whether a search is active.
+  const q = searchQuery.trim().toLowerCase();
+  const matchesSearch = (log: AuditLog) =>
+    log.action.toLowerCase().includes(q) || (log.errorMessage || '').toLowerCase().includes(q);
+  const filteredLogs = logs.filter(matchesSearch);
 
   const totalPages = Math.ceil(total / limit);
+  // Distinguish "filters matched nothing on this page" from "there are no logs at all": the search
+  // box only filters the fetched page (the API has no text search), so a non-match here must not
+  // read as "no such event exists" while more pages may hold it.
+  const hasSearch = q !== '';
+  // Severity is enforced SERVER-SIDE (the query carries it): an empty result there means no logs
+  // match at all, which deserves different guidance than the page-local search box.
+  const hasSeverityFilter = severityFilter !== 'all';
 
   const formatTimestamp = (date: string) => new Date(date).toLocaleString();
 
@@ -76,41 +85,44 @@ export function Logs() {
     a.href = url;
     a.download = `openwa-logs-${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
-    URL.revokeObjectURL(url);
+    scheduleObjectUrlRevoke(url);
   };
 
   // Export the WHOLE audit history (honouring the active severity filter + search), not just the
   // current page — paginate through the API up to a safety cap so a huge table can't OOM the tab. On
-  // a fetch error, fall back to exporting the rows already on screen.
+  // a fetch error, report it and download nothing: the rows on screen would pass for the full export.
   const handleExportCsv = async () => {
     if (exporting) return;
     setExporting(true);
     try {
-      const all = await fetchAllPages<AuditLog>((limit, offset) =>
+      const { items, truncated, throttled } = await fetchAllPages<AuditLog>((limit, offset) =>
         auditApi.list({ severity: severityParam, limit, offset }),
       );
-      const q = searchQuery.toLowerCase();
-      const rows = q
-        ? all.filter(l => l.action.toLowerCase().includes(q) || (l.errorMessage || '').toLowerCase().includes(q))
-        : all;
-      if (rows.length > 0) download(buildCsv(rows));
-    } catch {
-      if (filteredLogs.length > 0) download(buildCsv(filteredLogs)); // graceful fallback to the page
+      // The walk pages by offset over a live table, newest first: a row written between two pages pushes
+      // the older ones down, so the next page starts with one already fetched. Keep each id once.
+      const all = [...new Map(items.map(log => [log.id, log])).values()];
+      const rows = all.filter(matchesSearch);
+      // Either stop keeps the newest rows (the API orders newest first); older ones are missing. A
+      // narrower filter gets past the cap, only waiting gets past the throttle. The count follows the UI
+      // language, not the browser's locale, so it reads right inside the sentence.
+      const rowCount = all.length.toLocaleString(i18n.resolvedLanguage);
+      if (rows.length === 0) {
+        // After a truncated walk the older rows were never searched, so the message must not read as
+        // a verdict on the whole history.
+        if (truncated) toast.warning(t('logs.exportNoMatchesTruncated', { rows: rowCount }));
+        else toast.info(t('logs.exportNoMatches'));
+        return;
+      }
+      download(buildCsv(rows));
+      if (truncated) {
+        toast.warning(t(throttled ? 'logs.exportThrottled' : 'logs.exportTruncated', { rows: rowCount }));
+      }
+    } catch (err) {
+      toast.error(t('logs.exportFailed'), err instanceof Error ? err.message : undefined);
     } finally {
       setExporting(false);
     }
   };
-
-  if (loading && logs.length === 0) {
-    return (
-      <div
-        className="logs-page"
-        style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '400px' }}
-      >
-        <Loader2 className="animate-spin" size={32} />
-      </div>
-    );
-  }
 
   return (
     <div className="logs-page">
@@ -139,7 +151,11 @@ export function Logs() {
             type="text"
             placeholder={t('logs.searchPlaceholder')}
             value={searchQuery}
-            onChange={e => setSearchQuery(e.target.value)}
+            onChange={e => {
+              setSearchQuery(e.target.value);
+              // A new query invalidates the current page position, like the severity filter below.
+              setPage(1);
+            }}
           />
         </div>
 
@@ -151,12 +167,14 @@ export function Logs() {
               setSeverityFilter(value);
               setPage(1);
             }}
+            // No Error option: the gateway writes audit rows as info or warn only, failures included, so it would
+            // only ever show an empty table. A stored error row still renders its badge.
             options={[
               { value: 'all', label: t('logs.severity.all') },
               { value: 'info', label: t('logs.severity.info') },
               { value: 'warn', label: t('logs.severity.warn') },
-              { value: 'error', label: t('logs.severity.error') },
             ]}
+            ariaLabel={t('logs.columns.severity')}
           />
         </div>
       </div>
@@ -171,22 +189,56 @@ export function Logs() {
             <span>{t('logs.columns.ip')}</span>
             <span>{t('logs.columns.severity')}</span>
           </div>
-          {filteredLogs.length === 0 ? (
+          {/* The spinner stays inside the table: a search or severity change switches to a page that
+              may not be cached, and replacing the whole page would unmount the search box mid-typing. */}
+          {loading && logs.length === 0 ? (
+            <div className="empty-table-state">
+              <Loader2 className="animate-spin" size={32} />
+            </div>
+          ) : logsError && logs.length === 0 ? (
+            // Nothing was read, so no "no logs" copy: the banner above reports the failure on its own.
+            <div className="empty-table-state">
+              <AlertCircle size={32} />
+            </div>
+          ) : filteredLogs.length === 0 ? (
             <div className="empty-table-state">
               <FileText size={48} strokeWidth={1} />
-              <h3>{t('logs.empty.title')}</h3>
-              <p>{t('logs.empty.description')}</p>
+              {hasSeverityFilter && !hasSearch ? (
+                <>
+                  <h3>{t('logs.empty.title')}</h3>
+                  <p>{t('logs.empty.filteredServerDescription')}</p>
+                </>
+              ) : hasSearch ? (
+                <>
+                  <h3>{t('logs.empty.filteredTitle')}</h3>
+                  <p>{t('logs.empty.filteredDescription')}</p>
+                </>
+              ) : (
+                <>
+                  <h3>{t('logs.empty.title')}</h3>
+                  <p>{t('logs.empty.description')}</p>
+                </>
+              )}
             </div>
           ) : (
             filteredLogs.map(log => (
               <div key={log.id} className="table-row">
                 <span className="timestamp">{formatTimestamp(log.createdAt)}</span>
-                <span className="action">{log.action}</span>
-                <span>{log.sessionName || log.sessionId || '—'}</span>
-                <span className="api-key">{log.apiKeyName || '—'}</span>
-                <span className="ip">{log.ipAddress || '—'}</span>
+                <span className="action">
+                  {log.action}
+                  {log.errorMessage && <span className="log-message">{log.errorMessage}</span>}
+                </span>
+                <span className="session" title={log.sessionName || log.sessionId || undefined}>
+                  {log.sessionName || log.sessionId || '—'}
+                </span>
+                <span className="api-key" title={log.apiKeyName || undefined}>
+                  {log.apiKeyName || '—'}
+                </span>
+                <span className="ip" title={log.ipAddress || undefined}>
+                  {log.ipAddress || '—'}
+                </span>
                 <span>
-                  <span className={`severity-badge ${log.severity}`}>{log.severity.toUpperCase()}</span>
+                  <span className={`severity-badge ${log.severity}`}>{t(`logs.severity.${log.severity}`)}</span>
                 </span>
               </div>
             ))
@@ -201,7 +253,12 @@ export function Logs() {
           </button>
           <span className="page-numbers">
             {pageWindow(page, totalPages).map(p => (
-              <button key={p} className={p === page ? 'active' : ''} onClick={() => setPage(p)}>
+              <button
+                key={p}
+                className={p === page ? 'active' : ''}
+                aria-current={p === page ? 'page' : undefined}
+                onClick={() => setPage(p)}
+              >
                 {p}
               </button>
             ))}
