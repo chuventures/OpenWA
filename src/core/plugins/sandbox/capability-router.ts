@@ -32,6 +32,7 @@ export async function dispatchCapabilityVerb(
   context: CapabilityContext,
   verb: string,
   args: unknown[],
+  signal?: AbortSignal,
 ): Promise<unknown> {
   // Worker args cross a trust boundary: validate here so a malformed RPC fails the calling plugin
   // with a clear error instead of reaching the ORM with undefined criteria (TypeORM 1.x throws on
@@ -78,11 +79,20 @@ export async function dispatchCapabilityVerb(
     case 'storage.list':
       return context.storage.list(args[0] as string | undefined);
     case 'net.fetch':
-      return context.net.fetch(s(0), args[1] as Parameters<typeof context.net.fetch>[1]);
+      return signal
+        ? context.net.fetch(s(0), args[1] as Parameters<typeof context.net.fetch>[1], signal)
+        : context.net.fetch(s(0), args[1] as Parameters<typeof context.net.fetch>[1]);
     case 'conversation.send':
       return context.conversations.send(args[0] as ConversationSendEnvelope);
-    case 'handover.set':
-      return context.handover.set(mappingKey(0), args[1] as HandoverState);
+    case 'handover.set': {
+      // Only 'human'/'closed' hold a chat, so any other value would be stored and silently never take over.
+      const key = mappingKey(0);
+      const state = args[1];
+      if (state !== 'bot' && state !== 'human' && state !== 'closed') {
+        throw new Error(`Capability ${verb}: argument 1 must be 'bot', 'human' or 'closed'`);
+      }
+      return context.handover.set(key, state);
+    }
     case 'mappings.upsert':
       return context.mappings.upsert(mappingKey(0), s(1));
     case 'mappings.get':

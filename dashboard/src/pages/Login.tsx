@@ -4,11 +4,18 @@ import { Eye, EyeOff, Languages } from 'lucide-react';
 import { GithubIcon } from '../components/GithubIcon';
 import { CustomSelect } from '../components/CustomSelect';
 import { languageOptions, resolveSupportedLanguage, type SupportedLanguage } from '../i18n';
-import { API_BASE_URL } from '../services/api';
+import { authApi } from '../services/api';
 import './Login.css';
 
+export interface LoginSessionResult {
+  role?: string;
+  engineType?: string;
+  scoped?: boolean;
+  apiKeyId?: string;
+}
+
 interface LoginProps {
-  onLogin: (apiKey: string) => void;
+  onLogin: (session: LoginSessionResult) => void;
 }
 
 export function Login({ onLogin }: LoginProps) {
@@ -25,7 +32,9 @@ export function Login({ onLogin }: LoginProps) {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!apiKey.trim()) {
+    // The stored key is matched against key prefixes elsewhere, so a pasted space must not reach it.
+    const key = apiKey.trim();
+    if (!key) {
       setError(t('login.apiKeyRequired'));
       return;
     }
@@ -33,19 +42,37 @@ export function Login({ onLogin }: LoginProps) {
     setError('');
 
     try {
-      const response = await fetch(`${API_BASE_URL}/auth/validate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-API-Key': apiKey,
-        },
-      });
+      const response = await authApi.createSession(key);
 
       if (response.ok) {
-        onLogin(apiKey);
+        // The session exchange sets the HttpOnly browser cookie and returns non-secret session
+        // metadata so the app can hydrate role/scope/engine without a second round-trip.
+        const data: {
+          valid?: unknown;
+          role?: string;
+          engineType?: string;
+          scoped?: unknown;
+          apiKeyId?: unknown;
+        } = await response.json().catch(() => ({}));
+        // A 200 is the gateway's answer only if it says the session is valid: a reverse proxy
+        // serving the app's HTML for a misrouted /api would otherwise sign any typed text in as a viewer.
+        if (data.valid !== true) {
+          setError(t('login.connectionError'));
+          return;
+        }
+        setApiKey('');
+        onLogin({
+          role: data.role,
+          engineType: typeof data.engineType === 'string' ? data.engineType : undefined,
+          scoped: data.scoped === true,
+          apiKeyId: typeof data.apiKeyId === 'string' && data.apiKeyId.length > 0 ? data.apiKeyId : undefined,
+        });
       } else {
-        const errorData = await response.json().catch(() => ({}));
-        setError(errorData.message || t('login.invalidKey'));
+        // A 5xx, or a body that is not the gateway's JSON (a proxy error page while it restarts), says
+        // nothing about the key; a refusal keeps the gateway's reason (expired, revoked, rate limited).
+        const errorData: { message?: unknown } = await response.json().catch(() => ({}));
+        const reason = response.status < 500 && typeof errorData.message === 'string' ? errorData.message : '';
+        setError(reason || t(response.status === 401 ? 'login.invalidKey' : 'login.connectionError'));
       }
     } catch {
       setError(t('login.connectionError'));
@@ -90,6 +117,8 @@ export function Login({ onLogin }: LoginProps) {
                 onChange={e => setApiKey(e.target.value)}
                 placeholder={t('login.apiKeyPlaceholder')}
                 className={error ? 'error' : ''}
+                aria-invalid={error ? true : undefined}
+                aria-describedby={error ? 'apiKey-error' : undefined}
               />
               <button
                 type="button"
@@ -100,7 +129,11 @@ export function Login({ onLogin }: LoginProps) {
                 {showKey ? <EyeOff size={20} /> : <Eye size={20} />}
               </button>
             </div>
-            {error && <span className="error-message">{error}</span>}
+            {error && (
+              <span id="apiKey-error" className="error-message" role="alert">
+                {error}
+              </span>
+            )}
           </div>
 
           <button type="submit" className="connect-btn" disabled={isLoading}>

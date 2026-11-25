@@ -4,9 +4,17 @@ import { Repository, DataSource } from 'typeorm';
 import { BadGatewayException, ConflictException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { SessionService } from './session.service';
+import { SessionEngineLifecycle } from './session-engine-lifecycle.service';
+import { SessionErrorStore } from './session-error-store.service';
+import { SessionRestrictionStore } from './session-restriction-store.service';
+import { PresenceStore } from './presence-store.service';
 import { Session, SessionStatus } from './entities/session.entity';
 import { Message } from '../message/entities/message.entity';
 import { EngineFactory } from '../../engine/engine.factory';
+import { EngineRegistry } from '../../engine/engine-registry.service';
+import { SessionLidResolver } from './session-lid-resolver.service';
+import { SessionLivenessWatchdog } from './session-liveness-watchdog.service';
+import { MessageProjector } from './message-projector.service';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
@@ -28,6 +36,11 @@ function createMockSession(overrides: Partial<Session> = {}): Session {
     proxyType: null,
     connectedAt: null,
     lastActiveAt: null,
+    nodeId: null,
+    claimedAt: null,
+    leaseExpiresAt: null,
+    desiredState: null,
+    nodeUrl: null,
     createdAt: new Date(),
     updatedAt: new Date(),
     ...overrides,
@@ -53,8 +66,20 @@ async function expectNameTeardownPending(p: Promise<unknown>): Promise<void> {
   expect(thrown?.response?.code).toBe('SESSION_NAME_TEARDOWN_PENDING');
 }
 
+/** The messages of a session are read through a query builder: every chain call returns itself, the raw read is empty. */
+const emptyMessageQuery = () => {
+  const query: Record<string, jest.Mock> = { getRawMany: jest.fn().mockResolvedValue([]) };
+  for (const name of ['select', 'addSelect', 'where', 'andWhere', 'orderBy', 'addOrderBy', 'limit']) {
+    query[name] = jest.fn().mockReturnValue(query);
+  }
+  return query;
+};
+
 describe('SessionService logout() name-scoped teardown fence', () => {
   let service: SessionService;
+  // The teardown fence + lifecycle state live on the engine-lifecycle owner after the god-object
+  // split; the white-box pokes below target it directly, the public-API calls stay on `service`.
+  let lifecycle: SessionEngineLifecycle;
   let repository: jest.Mocked<Partial<Repository<Session>>>;
   let engineFactory: jest.Mocked<Partial<EngineFactory>>;
 
@@ -62,10 +87,17 @@ describe('SessionService logout() name-scoped teardown fence', () => {
     repository = {
       findOne: jest.fn().mockResolvedValue(createMockSession()),
       update: jest.fn().mockResolvedValue({ affected: 1 }),
+      exists: jest.fn().mockResolvedValue(false),
     };
-    const messageRepository = { find: jest.fn().mockResolvedValue([]) };
+    const messageRepository = {
+      find: jest.fn().mockResolvedValue([]),
+      createQueryBuilder: jest.fn(emptyMessageQuery),
+      delete: jest.fn(),
+    };
     const manager = { delete: jest.fn().mockResolvedValue({ affected: 1 }), remove: jest.fn() };
     const dataSource: Partial<DataSource> = {
+      options: { type: 'better-sqlite3' } as DataSource['options'],
+      getRepository: jest.fn(() => messageRepository) as unknown as DataSource['getRepository'],
       transaction: jest.fn(async (cb: (m: unknown) => Promise<void>) =>
         cb(manager),
       ) as unknown as DataSource['transaction'],
@@ -85,10 +117,19 @@ describe('SessionService logout() name-scoped teardown fence', () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         SessionService,
+        SessionEngineLifecycle,
+        SessionErrorStore,
+        SessionRestrictionStore,
+        PresenceStore,
         { provide: getRepositoryToken(Session, 'data'), useValue: repository },
         { provide: getRepositoryToken(Message, 'data'), useValue: messageRepository },
         { provide: getDataSourceToken('data'), useValue: dataSource },
         { provide: EngineFactory, useValue: engineFactory },
+        // Real registry: this suite asserts on engine map state across the teardown fence.
+        EngineRegistry,
+        SessionLidResolver,
+        SessionLivenessWatchdog,
+        MessageProjector,
         {
           provide: EventsGateway,
           useValue: { emitSessionStatus: jest.fn(), emitSessionDisconnected: jest.fn(), emitQRCode: jest.fn() },
@@ -99,21 +140,59 @@ describe('SessionService logout() name-scoped teardown fence', () => {
           provide: ConfigService,
           useValue: { get: jest.fn().mockImplementation(<T>(_k: string, d?: T): T => d as T) },
         },
-        { provide: LidMappingStoreService, useValue: { remember: jest.fn() } },
+        { provide: LidMappingStoreService, useValue: { remember: jest.fn(), onSecondLid: jest.fn() } },
         { provide: StatusStoreService, useValue: { ingest: jest.fn() } },
       ],
     }).compile();
 
     service = module.get<SessionService>(SessionService);
+    lifecycle = module.get<SessionEngineLifecycle>(SessionEngineLifecycle);
   });
 
   const enginesOf = () => (service as unknown as { engines: Map<string, unknown> }).engines;
-  const pendingOf = () => (service as unknown as { pendingTeardowns: Map<string, Promise<void>> }).pendingTeardowns;
-  const stoppingOf = () => (service as unknown as { stoppingSessions: Set<string> }).stoppingSessions;
-  const reconnectStatesOf = () => (service as unknown as { reconnectStates: Map<string, unknown> }).reconnectStates;
+  const pendingOf = () => (lifecycle as unknown as { pendingTeardowns: Map<string, Promise<void>> }).pendingTeardowns;
+  const stoppingOf = () => (lifecycle as unknown as { stoppingSessions: Set<string> }).stoppingSessions;
+  const reconnectStatesOf = () => (lifecycle as unknown as { reconnectStates: Map<string, unknown> }).reconnectStates;
   const errorsOf = () => (service as unknown as { sessionErrors: Map<string, string> }).sessionErrors;
   const lastStatusOf = () =>
-    (service as unknown as { lastDispatchedStatus: Map<string, unknown> }).lastDispatchedStatus;
+    (lifecycle as unknown as { lastDispatchedStatus: Map<string, unknown> }).lastDispatchedStatus;
+
+  const rejectRebind = (previous: string, incoming: string, engine: unknown) =>
+    (
+      lifecycle as unknown as {
+        rejectRebind: (id: string, e: unknown, name: string, prev: string, inc: string) => Promise<void>;
+      }
+    ).rejectRebind(SESSION_UUID, engine, SESSION_NAME, previous, incoming);
+
+  it('rejectRebind logs the wrong account out, fails the session, and keeps the original binding', async () => {
+    const logout = jest.fn().mockResolvedValue(undefined);
+    const engine = { logout };
+    enginesOf().set(SESSION_UUID, engine);
+
+    await rejectRebind('628111', '628999', engine);
+
+    // The wrong account is torn down, the session is parked in FAILED with a reason naming both
+    // numbers, and the engine is dropped. The original binding is preserved: no `{ phone: null }`.
+    expect(logout).toHaveBeenCalledTimes(1);
+    expect(lastStatusOf().get(SESSION_UUID)).toBe(SessionStatus.FAILED);
+    expect(errorsOf().get(SESSION_UUID)).toEqual(expect.stringContaining('628111'));
+    expect(errorsOf().get(SESSION_UUID)).toEqual(expect.stringContaining('628999'));
+    expect(enginesOf().has(SESSION_UUID)).toBe(false);
+    expect(stoppingOf().has(SESSION_UUID)).toBe(true);
+    expect(repository.update).not.toHaveBeenCalledWith(SESSION_UUID, { phone: null });
+  });
+
+  it('rejectRebind on a stale engine does nothing (isLiveEngine gate)', async () => {
+    const logout = jest.fn().mockResolvedValue(undefined);
+    const staleEngine = { logout };
+    // A DIFFERENT engine is the live one, so the stale handler must not log out or fail the session.
+    enginesOf().set(SESSION_UUID, { logout: jest.fn() });
+
+    await rejectRebind('628111', '628999', staleEngine);
+
+    expect(logout).not.toHaveBeenCalled();
+    expect(lastStatusOf().get(SESSION_UUID)).not.toBe(SessionStatus.FAILED);
+  });
 
   it('quick-settling teardown: start waits for it, then proceeds', async () => {
     let releaseLogout!: () => void;
@@ -167,7 +246,7 @@ describe('SessionService logout() name-scoped teardown fence', () => {
 
       releaseLogout();
       await deleteCall;
-      expect(engineFactory.purgeSessionData).toHaveBeenCalledWith(SESSION_NAME);
+      expect(engineFactory.purgeSessionData).toHaveBeenCalledWith(SESSION_UUID, SESSION_NAME);
       expect(pendingOf().has(SESSION_NAME)).toBe(false);
     } finally {
       jest.useRealTimers();
@@ -204,12 +283,19 @@ describe('SessionService logout() name-scoped teardown fence', () => {
   it('old-name teardown still pending past 10s: delete rejects 409, transaction parent removal and purgeSessionData not called (unique name still reserved)', async () => {
     const manager = { delete: jest.fn().mockResolvedValue({ affected: 1 }), remove: jest.fn() };
     const dataSource: Partial<DataSource> = {
+      options: { type: 'better-sqlite3' } as DataSource['options'],
+      getRepository: jest.fn(() => ({
+        find: jest.fn().mockResolvedValue([]),
+        createQueryBuilder: jest.fn(emptyMessageQuery),
+        delete: jest.fn(),
+      })) as unknown as DataSource['getRepository'],
       transaction: jest.fn(async (cb: (m: unknown) => Promise<void>) =>
         cb(manager),
       ) as unknown as DataSource['transaction'],
     };
-    // Swap in a dataSource whose transaction we can assert was NOT run.
-    (service as unknown as { dataSource: unknown }).dataSource = dataSource;
+    // Swap in a dataSource whose transaction we can assert was NOT run. delete() runs on the
+    // lifecycle owner now, so the swap must land there to intercept the path under test.
+    (lifecycle as unknown as { dataSource: unknown }).dataSource = dataSource;
     (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ id: SESSION_UUID, name: SESSION_NAME }));
 
     const neverSettles = new Promise<void>(() => undefined);
@@ -314,10 +400,10 @@ describe('SessionService logout() name-scoped teardown fence', () => {
     // engine fires its credential-teardown callback synchronously inside that teardown window — between
     // fence #1 and fence #2. Drive the service's own tracking the same way the adapter would.
     const trackPending = (
-      service as unknown as {
+      lifecycle as unknown as {
         trackPendingCredentialTeardown: (name: string, raw: Promise<void>) => void;
       }
-    ).trackPendingCredentialTeardown.bind(service);
+    ).trackPendingCredentialTeardown.bind(lifecycle);
     enginesOf().set(SESSION_UUID, {
       forceDestroy: jest.fn().mockImplementation(() => {
         // Simulate the adapter firing onCredentialTeardownStarted for a logout that captured this

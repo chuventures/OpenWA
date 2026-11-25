@@ -6,7 +6,7 @@ export interface IncomingStatus {
   contactJid: string;
   contactName?: string;
   contactPushName?: string;
-  type: 'text' | 'image' | 'video';
+  type: 'text' | 'image' | 'video' | 'voice';
   caption?: string;
   backgroundColor?: string;
   font?: number;
@@ -14,20 +14,26 @@ export interface IncomingStatus {
   postedAt: number;
 }
 
-/** Collapse the rich MessageType to the status union (image/video, else text). */
-function statusType(t: string): 'text' | 'image' | 'video' {
-  return t === 'image' || t === 'video' ? t : 'text';
+/**
+ * Collapse the rich MessageType to the status union.
+ *
+ * `voice` is listed explicitly because both engines map a PTT message to it, and without that an
+ * incoming voice status would be stored as `text` — the bucket everything non-image/video fell into.
+ */
+function statusType(t: string): 'text' | 'image' | 'video' | 'voice' {
+  return t === 'image' || t === 'video' || t === 'voice' ? t : 'text';
 }
 
 /**
  * Build a neutral IncomingStatus from an inbound status-broadcast message, or null if `msg` is not a
- * usable status: not a status broadcast, missing an id, or the resolved poster is empty/the
+ * usable status: not a status broadcast, missing an id, a story that arrived already deleted (type
+ * `revoked`, which would otherwise collapse to an empty text story), or the resolved poster is empty/the
  * `status@broadcast` pseudo-JID itself. For a status broadcast the adapter puts the actual poster in
  * `author` (`from` is the shared `status@broadcast` channel), falling back to `from` for engines that
  * don't set `author`.
  */
 export function buildIncomingStatus(msg: IncomingMessage): IncomingStatus | null {
-  if (!msg.isStatusBroadcast || !msg.id) return null;
+  if (!msg.isStatusBroadcast || !msg.id || msg.type === 'revoked') return null;
   const contactJid = msg.author ?? msg.from;
   if (!contactJid || contactJid === 'status@broadcast') return null;
   return {

@@ -3,12 +3,13 @@
  * runs ahead of vitest (`.test-d.ts` sits outside vitest's `test/**\/*.test.ts` include, so there is
  * no suite to run here; the build tsconfigs exclude `test/`, so nothing else would check it).
  *
- * The status/label/channel routes hand the engine-neutral shapes from
- * `src/engine/interfaces/whatsapp-engine.interface.ts` straight to the client — no DTO, no remap —
- * so the record types below must mirror those shapes as JSON. Nothing else enforces that: the
- * controllers declare no `@ApiResponse` type, so `openapi.json` carries no schema for these routes
- * and `openapi:check` has nothing to diff, and the resource tests mock the transport and assert
- * URLs only (#754).
+ * The status, label and channel record types below describe what those routes answer. Their
+ * response schemas (`LabelDto`, `ChannelDto`, `ChannelMessageDto`, `StatusDto` and
+ * `StatusListResponseDto`) are published in `openapi.json`, and `check:contract-shapes` compares the
+ * SDK records with them field by field. This file adds a second check: the top-level keys of these
+ * records must match the engine-neutral shapes from
+ * `src/engine/interfaces/whatsapp-engine.interface.ts` as they arrive over JSON. The resource tests
+ * mock the transport and assert URLs only (#754), so they check neither.
  *
  * The `Wire*` types are the server interfaces as they arrive over JSON — `Date` fields serialize to
  * ISO strings, everything else is verbatim. Keep them in sync with the engine interface by hand;
@@ -16,7 +17,15 @@
  * @packageDocumentation
  */
 
-import type { CatalogInfo, ChannelMessageRecord, ChannelRecord, LabelRecord, StatusRecord } from '../src/types.js';
+import type {
+  CatalogInfo,
+  ChannelMessageRecord,
+  ChannelRecord,
+  ChatHistoryMessage,
+  HealthReadyResponse,
+  LabelRecord,
+  StatusRecord,
+} from '../src/types.js';
 
 /** `Label` — `hexColor` is the only colour field the wire shape carries. */
 interface WireLabel {
@@ -27,14 +36,14 @@ interface WireLabel {
 
 /**
  * `Status` — `timestamp`/`expiresAt` are `Date` on the server and ISO strings once serialized.
- * `mediaUrl`/`backgroundColor`/`font` are declared by the engine interface but no adapter populates
- * them yet (wwjs `collectStatuses()` sets neither; Baileys throws `unsupported`), so they are
- * optional here for forward-compatibility rather than because a response carries them today.
+ * Reads come from the status store: `mediaUrl` is set only when the status media was stored (it
+ * points at `/api/sessions/:id/status/:statusId/media`), and `backgroundColor`/`font` only when the
+ * stored row carries them, so all three are optional.
  */
 interface WireStatus {
   id: string;
   contact: { id: string; name?: string; pushName?: string };
-  type: 'text' | 'image' | 'video';
+  type: 'text' | 'image' | 'video' | 'voice';
   caption?: string;
   mediaUrl?: string;
   backgroundColor?: string;
@@ -43,7 +52,7 @@ interface WireStatus {
   expiresAt: string;
 }
 
-/** `Channel` — `picture`/`createdAt` come from the Baileys `toChannel()` path; wwjs omits both. */
+/** `Channel` — `createdAt` comes from the Baileys `toChannel()` path; wwjs omits it. No engine fills `picture`. */
 interface WireChannel {
   id: string;
   name: string;
@@ -64,6 +73,81 @@ interface WireChannelMessage {
   mediaUrl?: string;
 }
 
+/**
+ * `IncomingMessage` — `messages.history()` hands back the engine array verbatim, so the wire shape is
+ * that interface serialized. `backgroundColor`/`font` are set by the Baileys extended-text mapper but
+ * are not reachable through this route (Baileys answers `getChatHistory` with `unsupported`); they are
+ * declared for forward-compatibility.
+ *
+ * Scope, so nobody reads more into a green build than it carries: `Mirrors` compares TOP-LEVEL keys,
+ * so drift inside `contact`, `call`, `media`, `quotedMessage` or `location` compiles clean. And like
+ * every `Wire*` type here this one is a hand transcription, so a field added to the server's
+ * `IncomingMessage` does not fail this build either — `sdk-ci.yml` re-runs the job when that file
+ * changes, which prompts a human to update the transcription. What this pair does lock is the SDK
+ * type against the transcription: neither side can lose or gain a top-level key unnoticed.
+ */
+interface WireChatHistoryMessage {
+  id: string;
+  from: string;
+  to: string;
+  chatId: string;
+  body: string;
+  type:
+    | 'text'
+    | 'image'
+    | 'video'
+    | 'audio'
+    | 'voice'
+    | 'document'
+    | 'sticker'
+    | 'location'
+    | 'contact'
+    | 'poll'
+    | 'call'
+    | 'revoked'
+    | 'order'
+    | 'product'
+    | 'masked'
+    | 'unknown';
+  timestamp: number;
+  fromMe: boolean;
+  isGroup: boolean;
+  kind: 'individual' | 'group' | 'channel' | 'status' | 'broadcast' | 'unknown';
+  isStatusBroadcast?: boolean;
+  ephemeralDuration?: number;
+  isForwarded?: boolean;
+  forwardingScore?: number;
+  author?: string;
+  mentionedIds?: string[];
+  call?: { video: boolean; missed: boolean };
+  isLidSender?: boolean;
+  senderPhone?: string | null;
+  contact?: {
+    id?: string;
+    number?: string;
+    name?: string;
+    pushName?: string;
+    shortName?: string;
+    type?: string;
+    isMyContact?: boolean;
+    isWAContact?: boolean;
+    isBusiness?: boolean;
+    isEnterprise?: boolean;
+    verifiedName?: string;
+    verifiedLevel?: number;
+    isBlocked?: boolean;
+    labels?: string[];
+  };
+  backgroundColor?: string;
+  font?: number;
+  media?: { mimetype: string; filename?: string; data?: string; omitted?: boolean; sizeBytes?: number };
+  quotedMessage?: { id: string; body: string };
+  poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
+  location?: { latitude: number; longitude: number; description?: string; address?: string; url?: string };
+  order?: { orderId: string; token?: string };
+  product?: { productId: string; title?: string; description?: string; businessOwnerJid?: string };
+}
+
 /** `Catalog` — the control: this pair already agreed before #754 and must stay agreeing. */
 interface WireCatalog {
   id: string;
@@ -71,6 +155,15 @@ interface WireCatalog {
   description?: string;
   productCount: number;
   url: string;
+}
+
+/**
+ * `ReadinessResponseDto`: the 200 body of `GET /api/health/ready`. Each dependency is an object
+ * carrying its own `status`, not a bare string.
+ */
+interface WireReadiness {
+  status: string;
+  details: { mainDatabase: { status: 'up' | 'down' }; dataDatabase: { status: 'up' | 'down' } };
 }
 
 /**
@@ -92,5 +185,8 @@ const status: Mirrors<WireStatus, StatusRecord> = true;
 const channel: Mirrors<WireChannel, ChannelRecord> = true;
 const channelMessage: Mirrors<WireChannelMessage, ChannelMessageRecord> = true;
 const catalog: Mirrors<WireCatalog, CatalogInfo> = true;
+const chatHistoryMessage: Mirrors<WireChatHistoryMessage, ChatHistoryMessage> = true;
+const poll: Mirrors<NonNullable<WireChatHistoryMessage['poll']>, NonNullable<ChatHistoryMessage['poll']>> = true;
+const readiness: Mirrors<WireReadiness, HealthReadyResponse> = true;
 
-export const contract = [label, status, channel, channelMessage, catalog];
+export const contract = [label, status, channel, channelMessage, catalog, chatHistoryMessage, poll, readiness];

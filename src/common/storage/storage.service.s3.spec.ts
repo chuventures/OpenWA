@@ -3,11 +3,6 @@ import * as os from 'os';
 import * as path from 'path';
 import { ConfigService } from '@nestjs/config';
 
-// `archiver` v8 ships ESM-only, which ts-jest can't parse transitively. These tests never touch the
-// export path (archiver's only consumer), so a lightweight stub suffices — same approach as the local
-// spec. Must run before importing StorageService.
-jest.mock('archiver', () => ({ default: jest.fn() }));
-
 // Mock the AWS SDK so no real network call is made: HeadBucket resolves (bucket reachable), and the
 // S3Client constructor is a jest.fn so each test can assert on the exact config it received.
 jest.mock('@aws-sdk/client-s3', () => {
@@ -24,8 +19,17 @@ jest.mock('@aws-sdk/client-s3', () => {
   };
 });
 
-import { S3Client } from '@aws-sdk/client-s3';
-import { StorageService } from './storage.service';
+import {
+  DeleteObjectCommand,
+  GetObjectCommand,
+  HeadBucketCommand,
+  ListObjectsV2Command,
+  PutObjectCommand,
+  S3Client,
+} from '@aws-sdk/client-s3';
+import { Readable } from 'stream';
+import { LoggerService } from '../services/logger.service';
+import { S3_CONNECT_TIMEOUT_MS, S3_SOCKET_TIMEOUT_MS, StorageService } from './storage.service';
 
 // The subset of the AWS SDK's S3Client config this service sets — used purely to type the mock's call
 // args so the assertions below are type-checked instead of `any`.
@@ -34,6 +38,7 @@ type S3ClientConfig = {
   region: string;
   forcePathStyle?: boolean;
   credentials: { accessKeyId: string; secretAccessKey: string };
+  requestHandler?: { connectionTimeout?: number; socketTimeout?: number; requestTimeout?: number };
 };
 
 const mockedS3Client = S3Client as unknown as jest.Mock<unknown, [S3ClientConfig]>;
@@ -50,6 +55,9 @@ const ENV_KEYS = [
 
 // initializeS3Bucket() runs as a fire-and-forget promise; let its HeadBucket settle before asserting.
 const flush = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
+
+/** Whether the service currently routes to the bucket (the flag the boot probe and the re-probe set). */
+const s3AvailableOf = (svc: StorageService): boolean => (svc as unknown as { s3Available: boolean }).s3Available;
 
 /** The config passed to the most recent S3Client construction (throws if it was never constructed). */
 function lastConfig(): S3ClientConfig {
@@ -69,6 +77,10 @@ describe('StorageService (s3) client init', () => {
 
   afterEach(() => {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+    // The warning below is emitted from the constructor, so it can only be spied on the prototype.
+    // `restoreMocks` is not set for this project, so an assertion that throws before an inline
+    // restore would leave every later LoggerService in this file muted.
+    jest.restoreAllMocks();
   });
 
   // Build a ConfigService scoped to s3 storage; localPath points at the per-test tmp dir so the
@@ -90,13 +102,15 @@ describe('StorageService (s3) client init', () => {
     );
     await flush();
 
-    expect(mockedS3Client).toHaveBeenCalledTimes(1);
+    // One client for the store and one for the downloads openFile streams, built from the same config.
+    expect(mockedS3Client).toHaveBeenCalledTimes(2);
+    expect(mockedS3Client.mock.calls[1][0]).toEqual(mockedS3Client.mock.calls[0][0]);
     const cfg = lastConfig();
     expect(cfg.endpoint).toBeUndefined(); // AWS derives it from region
     expect(cfg.forcePathStyle).toBeFalsy(); // AWS uses virtual-hosted addressing
     expect(cfg.region).toBe('ap-southeast-1');
     expect(cfg.credentials).toEqual({ accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'shhh-secret' });
-    expect(svc.isS3Available()).toBe(true);
+    expect(s3AvailableOf(svc)).toBe(true);
   });
 
   it('keeps endpoint + forcePathStyle for an S3-compatible store (MinIO)', async () => {
@@ -106,20 +120,56 @@ describe('StorageService (s3) client init', () => {
     );
     await flush();
 
-    expect(mockedS3Client).toHaveBeenCalledTimes(1);
+    expect(mockedS3Client).toHaveBeenCalledTimes(2);
+    expect(mockedS3Client.mock.calls[1][0]).toEqual(mockedS3Client.mock.calls[0][0]);
     const cfg = lastConfig();
     expect(cfg.endpoint).toBe('http://minio:9000');
     expect(cfg.forcePathStyle).toBe(true);
-    expect(svc.isS3Available()).toBe(true);
+    expect(s3AvailableOf(svc)).toBe(true);
   });
 
-  it('falls back to local (no client) when credentials are missing', async () => {
+  // A store that accepts the connection and never answers would otherwise leave every request (the
+  // availability probe, media reads and archive writes) pending forever.
+  it('bounds every request with a connect and an idle-socket timeout', async () => {
+    new StorageService(makeConfig({ accessKeyId: 'minio', secretAccessKey: 'minio123', region: 'us-east-1' }));
+    await flush();
+
+    expect(mockedS3Client.mock.calls).toHaveLength(2);
+    for (const [cfg] of mockedS3Client.mock.calls) {
+      expect(cfg.requestHandler).toEqual({
+        connectionTimeout: S3_CONNECT_TIMEOUT_MS,
+        socketTimeout: S3_SOCKET_TIMEOUT_MS,
+      });
+    }
+  });
+
+  it('falls back to local (no client) when credentials are missing, and says so', async () => {
+    // Without a client none of the S3 logging further down ever runs, so this fallback used to be
+    // the one that produced no output at all: the bucket simply stayed empty. Name the two vars
+    // that fix it, since that is the whole point of warning here.
+    const warn = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
     const svc = new StorageService(makeConfig({ region: 'us-east-1' }));
     await flush();
 
     expect(mockedS3Client).not.toHaveBeenCalled();
-    expect(svc.isS3Available()).toBe(false);
+    expect(s3AvailableOf(svc)).toBe(false);
     expect(svc.getCurrentStorageType()).toBe('s3');
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('S3_ACCESS_KEY_ID'));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('S3_SECRET_ACCESS_KEY'));
+  });
+
+  it('names only the half of the credential pair that is missing', async () => {
+    // Reaching the fallback with one of the pair set is a typo in the other. A warning that called
+    // every credential absent would point the operator at the one they got right.
+    process.env.S3_ACCESS_KEY_ID = 'ENVKEY';
+    const warn = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+    new StorageService(makeConfig({ region: 'us-east-1' }));
+    await flush();
+
+    expect(mockedS3Client).not.toHaveBeenCalled();
+    const message = String(warn.mock.calls.at(-1)?.[0]);
+    expect(message).toContain('S3_SECRET_ACCESS_KEY');
+    expect(message).not.toContain('S3_ACCESS_KEY_ID');
   });
 
   it('prefers canonical env names (S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY) over config', async () => {
@@ -131,6 +181,160 @@ describe('StorageService (s3) client init', () => {
     await flush();
 
     expect(lastConfig().credentials).toEqual({ accessKeyId: 'ENVKEY', secretAccessKey: 'ENVSECRET' });
-    expect(svc.isS3Available()).toBe(true);
+    expect(s3AvailableOf(svc)).toBe(true);
+  });
+});
+
+// The local directory is not an s3-only leftover: it is the fallback while the bucket is unreachable, and it still holds
+// what was stored there before a move to s3. So it is made owner-only whatever STORAGE_TYPE is, and what the fallback
+// writes is owner-only too.
+describe('StorageService (s3) local directory modes', () => {
+  const dirs: string[] = [];
+  const stores: StorageService[] = [];
+
+  beforeEach(() => {
+    mockedS3Client.mockClear();
+    for (const key of ENV_KEYS) delete process.env[key];
+    jest.spyOn(LoggerService.prototype, 'log').mockImplementation(() => undefined);
+    jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(LoggerService.prototype, 'error').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    for (const store of stores.splice(0)) store.onModuleDestroy();
+    jest.restoreAllMocks();
+    for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const modeOf = (target: string): number => fs.statSync(target).mode & 0o777;
+
+  /** The media directory of a deployment that stored files locally before it moved to s3. */
+  const upgradedRoot = (): string => {
+    const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-s3-modes-'));
+    dirs.push(baseDir);
+    const root = path.join(baseDir, 'media');
+    const older = path.join(root, 'chat-media/session-a');
+    fs.mkdirSync(older, { recursive: true });
+    fs.writeFileSync(path.join(older, 'old.bin'), 'old');
+    for (const dir of [root, path.join(root, 'chat-media'), older]) fs.chmodSync(dir, 0o755);
+    fs.chmodSync(path.join(older, 'old.bin'), 0o644);
+    return root;
+  };
+
+  const build = (localPath: string): StorageService => {
+    const store = new StorageService({
+      get: (key: string) => {
+        if (key === 'storage.type') return 's3';
+        if (key === 'storage.localPath') return localPath;
+        if (key === 'storage.s3') return { accessKeyId: 'minio', secretAccessKey: 'minio123', region: 'us-east-1' };
+        return undefined;
+      },
+    } as unknown as ConfigService);
+    stores.push(store);
+    return store;
+  };
+
+  it('sets the local root owner-only with the bucket reachable, and leaves the files it holds', async () => {
+    const root = upgradedRoot();
+
+    const svc = build(root);
+    await flush();
+
+    expect(s3AvailableOf(svc)).toBe(true);
+    expect(modeOf(root)).toBe(0o700);
+    expect(modeOf(path.join(root, 'chat-media/session-a'))).toBe(0o755);
+    expect(modeOf(path.join(root, 'chat-media/session-a/old.bin'))).toBe(0o644);
+  });
+
+  it('writes the fallback owner-only while the bucket is unreachable', async () => {
+    const unreachable = { send: jest.fn().mockRejectedValue(new Error('connect ECONNREFUSED 127.0.0.1:9000')) };
+    // One client for the store and one for the downloads.
+    mockedS3Client.mockImplementationOnce(() => unreachable).mockImplementationOnce(() => unreachable);
+    const root = upgradedRoot();
+    const svc = build(root);
+    await flush();
+    expect(s3AvailableOf(svc)).toBe(false);
+
+    await svc.putFile('chat-media/session-b/clip.bin', Buffer.from('written during the outage'));
+
+    expect(modeOf(path.join(root, 'chat-media/session-b'))).toBe(0o700);
+    expect(modeOf(path.join(root, 'chat-media/session-b/clip.bin'))).toBe(0o600);
+    expect((await svc.getFile('chat-media/session-b/clip.bin')).toString()).toBe('written during the outage');
+  });
+
+  it('waits for the boot bucket probe in onModuleInit and before storage operations', async () => {
+    let releaseProbe!: () => void;
+    const probePending = new Promise<void>(resolve => (releaseProbe = resolve));
+    const commands: unknown[] = [];
+    const send = jest.fn(async (cmd: unknown) => {
+      commands.push(cmd);
+      if (cmd instanceof HeadBucketCommand) {
+        await probePending;
+        return {};
+      }
+      if (cmd instanceof GetObjectCommand) {
+        return { Body: Readable.from([Buffer.from('from-s3')]), ContentLength: 7 };
+      }
+      if (cmd instanceof ListObjectsV2Command) {
+        return { Contents: [{ Key: 'media/statuses/s1/item.bin' }] };
+      }
+      return {};
+    });
+    const client = { send };
+    mockedS3Client.mockImplementationOnce(() => client).mockImplementationOnce(() => client);
+
+    const root = upgradedRoot();
+    const svc = build(root);
+
+    let initResolved = false;
+    const initP = (svc as unknown as { onModuleInit?: () => Promise<void> }).onModuleInit?.().then(() => {
+      initResolved = true;
+    });
+    expect(initP).toBeDefined();
+
+    const putP = svc.putFile('statuses/s1/item.bin', Buffer.from('hello'));
+    const getP = svc.getFile('statuses/s1/item.bin');
+    const openP = svc.openFile('statuses/s1/item.bin');
+    const delP = svc.deleteFile('statuses/s1/item.bin');
+    const listP = (async () => {
+      const files: string[] = [];
+      for await (const file of svc.iterateFiles('statuses/')) files.push(file);
+      return files;
+    })();
+
+    await flush();
+    expect(initResolved).toBe(false);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toBeInstanceOf(HeadBucketCommand);
+
+    releaseProbe();
+    await initP;
+    await putP;
+    expect((await getP).toString()).toBe('from-s3');
+    const opened = await openP;
+    opened.stream.destroy();
+    await delP;
+    expect(await listP).toEqual(['statuses/s1/item.bin']);
+
+    expect(commands.some(cmd => cmd instanceof PutObjectCommand)).toBe(true);
+    expect(commands.some(cmd => cmd instanceof GetObjectCommand)).toBe(true);
+    expect(commands.some(cmd => cmd instanceof DeleteObjectCommand)).toBe(true);
+    expect(commands.some(cmd => cmd instanceof ListObjectsV2Command)).toBe(true);
+    expect(fs.existsSync(path.join(root, 'statuses/s1/item.bin'))).toBe(false);
+  });
+
+  it('fails closed in deleteFile while S3 is unavailable instead of deleting only the local copy', async () => {
+    const unreachable = { send: jest.fn().mockRejectedValue(new Error('connect ECONNREFUSED 127.0.0.1:9000')) };
+    mockedS3Client.mockImplementationOnce(() => unreachable).mockImplementationOnce(() => unreachable);
+    const root = upgradedRoot();
+    const svc = build(root);
+    await flush();
+    expect(s3AvailableOf(svc)).toBe(false);
+
+    const key = 'chat-media/session-a/old.bin';
+    await expect(svc.deleteFile(key)).rejects.toThrow(
+      `S3 storage is currently unavailable; refusing local-only delete for ${key}`,
+    );
+    expect(fs.existsSync(path.join(root, key))).toBe(true);
   });
 });

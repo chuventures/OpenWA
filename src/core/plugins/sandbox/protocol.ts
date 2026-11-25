@@ -1,15 +1,17 @@
 /**
- * Wire protocol between the host (PluginWorkerHost) and an untrusted plugin worker.
+ * Wire protocol between the host (PluginWorkerHost) and a plugin worker.
  *
- * The worker has exactly one channel out — these messages — and no ambient access to the host. The
- * host validates every request before acting on it, so a hostile worker cannot escalate beyond what
- * its manifest declares.
+ * These messages are the worker's channel to the `ctx.*` capabilities, and the host validates every
+ * request against the manifest's permissions before acting on it. They are not the worker's only way
+ * out: the worker is a thread in the host process and can use Node built-ins directly, so this is
+ * fault containment, not a security boundary (see worker-bootstrap.ts and docs/30).
  *
- * Phase B1 scope: lifecycle only (load + onLoad/onEnable/onDisable/onUnload). The capability bridge
- * (B2) and hook bridge (B3) add more message kinds later.
+ * Covers the lifecycle, capability calls, hooks, ingress webhooks, search, health checks and the
+ * liveness ping.
  */
 
 import type { SearchQuery, SearchResults } from '../../../modules/search/search.types';
+import type { HookEvent } from '../../hooks/hook.interfaces';
 
 export type PluginLifecycleMethod = 'onLoad' | 'onEnable' | 'onDisable' | 'onUnload';
 
@@ -19,7 +21,53 @@ export interface SandboxStaticContext {
   config: Record<string, unknown>;
 }
 
+/** Host-authoritative dispatch context (firing hook session or ingress instance) for a worker request. */
+export interface SandboxDispatchContext {
+  sessionId?: string;
+  instanceId?: string;
+}
+
 export type PluginLogLevel = 'log' | 'debug' | 'warn' | 'error';
+
+/**
+ * Bound on the `ctx.logger.*` lines one plugin gets across to the host: the worker sends at most this many per
+ * window and drops the rest on its own thread, so a loop that logs without yielding costs the host no more than
+ * the lines it writes. The host's log relay keeps the same bound as a backstop.
+ */
+export const SANDBOX_LOG_MAX_PER_WINDOW = 200;
+export const SANDBOX_LOG_WINDOW_MS = 10000;
+
+/**
+ * Max worker-initiated capability calls the host runs concurrently per sandboxed plugin. A burst beyond this is
+ * rejected (the plugin sees a thrown Error) rather than amplified into unbounded host-side sends/fetches/writes.
+ */
+export const SANDBOX_MAX_INFLIGHT_CAPS = 32;
+
+/**
+ * Capability calls a worker leaves unanswered before it holds the next one back. Twice the host's bound, so the host's
+ * own bound is still the one a slow verb meets first. A loop that does not await its calls stops posting here: each
+ * message past the host's bound is still read and answered on the host's one thread, so a call past this waits in the
+ * worker until a reply frees a slot, in the order the plugin made the calls.
+ */
+export const SANDBOX_MAX_PENDING_CAPS = SANDBOX_MAX_INFLIGHT_CAPS * 2;
+
+/**
+ * Capability calls a worker holds back at once, past SANDBOX_MAX_PENDING_CAPS. A loop that never yields fills this
+ * queue in the worker's own heap, and the call past it is refused, so the host is handed no more than
+ * SANDBOX_MAX_PENDING_CAPS messages while the loop runs.
+ */
+export const SANDBOX_MAX_HELD_CAPS = 10000;
+
+/**
+ * Capability verbs whose host-side work is an outbound message send. A send fires the hooks of the send (message:sending
+ * and the rest), so a hook handler that issues one can cause a dispatch of its own event again, and the host gives these
+ * verbs a wider timeout budget than a lookup.
+ */
+export const SEND_CAP_VERBS: ReadonlySet<string> = new Set([
+  'messages.sendText',
+  'messages.reply',
+  'conversation.send',
+]);
 
 export type HostToWorkerMessage =
   | { kind: 'load'; mainPath: string; context?: SandboxStaticContext }
@@ -33,11 +81,20 @@ export type HostToWorkerMessage =
   | {
       kind: 'hook';
       id: number;
+      dispatchId?: string;
+      /** Host-generated opaque token bound to the concrete sessionId of this hook dispatch for floated net.fetch calls. */
+      netScopeId?: string;
       event: string;
       data: unknown;
       sessionId?: string;
       source: string;
       config?: Record<string, unknown>;
+      // The host's in-flight hook chain for this dispatch (this event plus any ancestor event whose
+      // handler led to it). The worker echoes it on every capability call the handler makes, so the
+      // host re-establishes the re-entrancy guard for that causal chain only.
+      inFlight?: string[];
+      /** True when the host chain is executing in fail-closed mode for this dispatch. */
+      failClosed?: boolean;
     }
   // The plugin's config was updated: refresh ctx.config and invoke onConfigChange (fire-and-forget).
   | { kind: 'config-change'; config: Record<string, unknown> }
@@ -46,11 +103,14 @@ export type HostToWorkerMessage =
   // Dispatch an inbound webhook to the worker for a route it subscribed to (webhook-subscribe).
   // `body`/`rawBody` are buffered host-side to a string, like PluginNetResponse.body. `verified`
   // reflects whether the host authenticated the delivery via the route's signature scheme; it is
-  // false for scheme:none. PluginIngressRoute.verify:'self' is reserved and does not trigger a second
-  // worker-side verification pass. The worker replies with webhook-result.
+  // false for scheme:none, and on hmac-sha256 and standard-webhooks for an empty body with a query
+  // string. No scheme signs the query or the method, so neither is authenticated even when it is true.
+  // PluginIngressRoute.verify:'self' is reserved and does not trigger a second worker-side verification
+  // pass. The worker replies with webhook-result.
   | {
       kind: 'webhook';
       id: number;
+      dispatchId?: string;
       instanceId: string;
       route: string;
       method: string;
@@ -69,7 +129,10 @@ export type HostToWorkerMessage =
   // runs the plugin's search handler and replies with `search-result` (same `id` correlation as
   // hook/health-check/webhook). No per-session config: search is a global query; session scoping travels
   // inside SearchQuery.sessionIds (scoped by SearchService from the caller's API-key).
-  | { kind: 'search'; id: number; query: SearchQuery };
+  | { kind: 'search'; id: number; query: SearchQuery }
+  // Liveness probe, sent after a dispatch times out. The worker bootstrap answers it before any plugin
+  // code runs, so a slow async handler still answers and only a blocked event loop stays silent.
+  | { kind: 'ping'; id: number };
 
 export type WorkerToHostMessage =
   | { kind: 'ready' }
@@ -77,7 +140,23 @@ export type WorkerToHostMessage =
   | { kind: 'lifecycle-result'; id: number; ok: false; error: string }
   // Worker-initiated capability call (ctx.messages.* / ctx.engine.* / ctx.storage.*). The host
   // validates it (permission + session scope) before running the real verb and replying.
-  | { kind: 'cap'; id: number; verb: string; args: unknown[] }
+  // `inFlight` is the chain of the hook dispatch whose handler issued the call (absent outside a hook,
+  // e.g. an ingress handler or a timer); the host trusts only events it actually dispatched.
+  // `dispatchId` echoes the host-generated id of the active hook or webhook dispatch so the host can
+  // look up its authoritative session/instance context without trusting worker-supplied identifiers.
+  // `originHook` names the hook event whose handler initiated the call; the host verifies it against
+  // the active dispatch tracked in inFlightDispatches before re-establishing hook context.
+  | {
+      kind: 'cap';
+      id: number;
+      verb: string;
+      args: unknown[];
+      inFlight?: string[];
+      dispatchId?: string;
+      /** Sent for `net.fetch` after a concrete-session hook dispatch has already returned, keeping floated fetches session-scoped. */
+      netScopeId?: string;
+      originHook?: HookEvent;
+    }
   // The worker asks the host to dispatch `event` to it (registered a handler for it).
   | { kind: 'hook-subscribe'; event: string; priority?: number }
   // The worker's handler result for a dispatched hook (continue/modify/error).
@@ -88,8 +167,8 @@ export type WorkerToHostMessage =
   | { kind: 'health-result'; id: number; healthy: boolean; message?: string }
   // The worker claims an ingress route declared in its manifest (registered a webhook handler for it).
   | { kind: 'webhook-subscribe'; route: string }
-  // The worker's response to a dispatched webhook — the host relays this to the caller (sync-reply
-  // mode) or discards it (async mode). `error` set = the handler threw.
+  // The worker's result for a dispatched webhook; `error` set = the handler threw. The ingress job treats
+  // a non-ok result as a failed delivery and retries it.
   | {
       kind: 'webhook-result';
       id: number;
@@ -105,6 +184,7 @@ export type WorkerToHostMessage =
   // carries the handler's error (handler threw / no handler / etc.).
   | { kind: 'search-result'; id: number; ok: true; results: SearchResults }
   | { kind: 'search-result'; id: number; ok: false; error: string }
+  | { kind: 'pong'; id: number }
   | { kind: 'error'; error: string };
 
 /**

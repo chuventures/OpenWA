@@ -31,7 +31,7 @@ class MessagesResource
      */
     public function list(string $sessionId, array $query = []): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages", $query)
+        return $this->http->requestNullableArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages", $query)
             ?? ['messages' => [], 'total' => 0];
     }
 
@@ -39,66 +39,71 @@ class MessagesResource
      * @param array<string,mixed> $body
      * @return array<string,mixed>
      */
-    public function sendText(string $sessionId, array $body): array
+    public function sendText(string $sessionId, array $body, ?string $idempotencyKey = null): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/send-text", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/send-text", [], HttpExecutor::lists($body, 'mentions'), $idempotencyKey);
     }
 
     /**
      * @param array<string,mixed> $body
      * @return array<string,mixed>
      */
-    public function sendImage(string $sessionId, array $body): array
+    public function sendImage(string $sessionId, array $body, ?string $idempotencyKey = null): array
     {
-        return $this->sendMedia($sessionId, 'send-image', $body);
+        return $this->sendMedia($sessionId, 'send-image', $body, $idempotencyKey);
     }
 
     /** @return array<string,mixed> */
-    public function sendVideo(string $sessionId, array $body): array
+    public function sendVideo(string $sessionId, array $body, ?string $idempotencyKey = null): array
     {
-        return $this->sendMedia($sessionId, 'send-video', $body);
+        return $this->sendMedia($sessionId, 'send-video', $body, $idempotencyKey);
     }
 
     /** @return array<string,mixed> */
-    public function sendAudio(string $sessionId, array $body): array
+    public function sendAudio(string $sessionId, array $body, ?string $idempotencyKey = null): array
     {
-        return $this->sendMedia($sessionId, 'send-audio', $body);
+        return $this->sendMedia($sessionId, 'send-audio', $body, $idempotencyKey);
     }
 
     /** @return array<string,mixed> */
-    public function sendDocument(string $sessionId, array $body): array
+    public function sendDocument(string $sessionId, array $body, ?string $idempotencyKey = null): array
     {
-        return $this->sendMedia($sessionId, 'send-document', $body);
+        return $this->sendMedia($sessionId, 'send-document', $body, $idempotencyKey);
     }
 
     /** @return array<string,mixed> */
-    public function sendSticker(string $sessionId, array $body): array
+    public function sendSticker(string $sessionId, array $body, ?string $idempotencyKey = null): array
     {
-        return $this->sendMedia($sessionId, 'send-sticker', $body);
+        return $this->sendMedia($sessionId, 'send-sticker', $body, $idempotencyKey);
     }
 
     /** @return array<string,mixed> */
-    private function sendMedia(string $sessionId, string $segment, array $body): array
+    private function sendMedia(string $sessionId, string $segment, array $body, ?string $idempotencyKey = null): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/{$this->http->encodeSegment($segment)}", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/{$this->http->encodeSegment($segment)}", [], HttpExecutor::lists($body, 'mentions'), $idempotencyKey);
     }
 
     /** @return array<string,mixed> */
-    public function sendLocation(string $sessionId, array $body): array
+    public function sendLocation(string $sessionId, array $body, ?string $idempotencyKey = null): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/send-location", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/send-location", [], $body, $idempotencyKey);
     }
 
     /** @return array<string,mixed> */
-    public function sendContact(string $sessionId, array $body): array
+    public function sendContact(string $sessionId, array $body, ?string $idempotencyKey = null): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/send-contact", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/send-contact", [], $body, $idempotencyKey);
     }
 
     /** @return array<string,mixed> */
-    public function sendTemplate(string $sessionId, array $body): array
+    public function sendTemplate(string $sessionId, array $body, ?string $idempotencyKey = null): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/send-template", [], $body);
+        $body = HttpExecutor::lists($body, 'mentions');
+        // Encode maps as objects without assigning through caller-held references.
+        if (isset($body['vars']) && is_array($body['vars'])) {
+            $body = array_merge($body, ['vars' => (object) $body['vars']]);
+        }
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/send-template", [], $body, $idempotencyKey);
     }
 
     /**
@@ -107,33 +112,44 @@ class MessagesResource
      * @param array<string,mixed> $body {chatId, name, options, allowMultipleAnswers?}
      * @return array<string,mixed>
      */
-    public function sendPoll(string $sessionId, array $body): array
+    public function sendPoll(string $sessionId, array $body, ?string $idempotencyKey = null): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/send-poll", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/send-poll", [], HttpExecutor::lists($body, 'options'), $idempotencyKey);
     }
 
     /** @return array<string,mixed> */
-    public function reply(string $sessionId, array $body): array
+    public function reply(string $sessionId, array $body, ?string $idempotencyKey = null): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/reply", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/reply", [], HttpExecutor::lists($body, 'mentions'), $idempotencyKey);
+    }
+
+    /**
+     * Click a button on a WhatsApp Business prompt. Baileys only (whatsapp-web.js returns 501).
+     *
+     * @param array<string,mixed> $body chatId, messageId, buttonId; text optional.
+     * @return array<string,mixed>
+     */
+    public function clickButton(string $sessionId, array $body, ?string $idempotencyKey = null): array
+    {
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/click-button", [], $body, $idempotencyKey);
     }
 
     /** @return array<string,mixed> */
-    public function forward(string $sessionId, array $body): array
+    public function forward(string $sessionId, array $body, ?string $idempotencyKey = null): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/forward", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/forward", [], $body, $idempotencyKey);
     }
 
     /** @return array<string,mixed> */
     public function react(string $sessionId, array $body): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/react", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/react", [], $body);
     }
 
     /** @return array<string,mixed> */
     public function delete(string $sessionId, array $body): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/delete", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/delete", [], $body);
     }
 
     /**
@@ -145,39 +161,128 @@ class MessagesResource
      */
     public function editMessage(string $sessionId, array $body): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/edit", [], $body);
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/edit", [], HttpExecutor::lists($body, 'mentions'));
     }
 
     /**
+     * Read a chat's message history live from WhatsApp. whatsapp-web.js only; Baileys answers 501.
+     * Poll messages include poll.name, poll.options, and poll.allowMultipleAnswers when available.
      * @param array<string,mixed> $query
      * @return array<int,array<string,mixed>>
      */
     public function history(string $sessionId, string $chatId, array $query = []): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/{$this->http->encodeSegment($chatId)}/history", $query) ?? [];
+        return $this->http->requestNullableArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/{$this->http->encodeSegment($chatId)}/history", $query) ?? [];
     }
 
-    /** @return array<int,array<string,mixed>> */
+    /**
+     * Get the reactions on a message. whatsapp-web.js only; Baileys answers 501.
+     *
+     * @return array<int,array<string,mixed>>
+     */
     public function reactions(string $sessionId, string $chatId, string $messageId): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/{$this->http->encodeSegment($chatId)}/{$this->http->encodeSegment($messageId)}/reactions") ?? [];
+        return $this->http->requestNullableArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/{$this->http->encodeSegment($chatId)}/{$this->http->encodeSegment($messageId)}/reactions") ?? [];
+    }
+
+    /**
+     * Get who received, read and played a message the account sent. whatsapp-web.js only; Baileys answers 501.
+     *
+     * @return array<string,mixed>
+     */
+    public function receipts(string $sessionId, string $chatId, string $messageId): array
+    {
+        return $this->http->requestNullableArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/{$this->http->encodeSegment($chatId)}/{$this->http->encodeSegment($messageId)}/receipts") ?? [];
+    }
+
+    /**
+     * Pin a message in its chat.
+     *
+     * @param array<string,mixed> $body chatId, messageId and an optional durationSeconds of
+     *                                   86400 (24h), 604800 (7d) or 2592000 (30d); defaults to 24h.
+     * @return array<string,mixed>
+     */
+    public function pin(string $sessionId, array $body): array
+    {
+        return $this->http->requestNullableArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/pin", [], $body) ?? [];
+    }
+
+    /**
+     * Cast a vote on a poll. Not supported on the Baileys engine (501).
+     *
+     * @param array<string,mixed> $body chatId, pollMessageId and options (option TEXTS; [] clears).
+     * @return array<string,mixed>
+     */
+    public function votePoll(string $sessionId, array $body): array
+    {
+        return $this->http->requestNullableArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/vote-poll", [], HttpExecutor::lists($body, 'options')) ?? [];
+    }
+
+    /**
+     * Star or unstar a message. Best-effort on whatsapp-web.js, which silently ignores a message
+     * it will not star.
+     *
+     * @param array<string,mixed> $body chatId, messageId and star (bool).
+     * @return array<string,mixed>
+     */
+    public function star(string $sessionId, array $body): array
+    {
+        return $this->http->requestNullableArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/star", [], $body) ?? [];
+    }
+
+    /**
+     * @param array<string,mixed> $body
+     * @return array<string,mixed>
+     */
+    public function unpin(string $sessionId, array $body): array
+    {
+        return $this->http->requestNullableArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/unpin", [], $body) ?? [];
+    }
+
+    /**
+     * Fetch a message's stored media bytes: the archived file when one exists, else the inline
+     * copy on the message row (covers media sent by this account); 404 when neither holds bytes.
+     *
+     * @return array{data: string, contentType: ?string}
+     */
+    public function media(string $sessionId, string $chatId, string $messageId): array
+    {
+        return $this->http->requestBinary('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/{$this->http->encodeSegment($chatId)}/{$this->http->encodeSegment($messageId)}/media");
     }
 
     /** @return array<string,mixed> */
     public function sendBulk(string $sessionId, array $body): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/send-bulk", [], $body);
+        // Rebuild each array layer so referenced maps, items and lists stay untouched. array_values keeps a
+        // filtered list a JSON array: json_encode writes one with key gaps as an object, which the gateway refuses.
+        if (isset($body['messages']) && is_array($body['messages'])) {
+            $body = array_merge($body, [
+                'messages' => array_values(array_map(static function ($item) {
+                    if (is_array($item) && isset($item['content']) && is_array($item['content'])) {
+                        $item = array_replace($item, ['content' => HttpExecutor::lists($item['content'], 'mentions')]);
+                    }
+                    if (is_array($item) && isset($item['variables']) && is_array($item['variables'])) {
+                        return array_merge($item, ['variables' => (object) $item['variables']]);
+                    }
+                    return $item;
+                }, $body['messages'])),
+            ]);
+        }
+        if (isset($body['options']) && is_array($body['options'])) {
+            $body = array_merge($body, ['options' => (object) $body['options']]);
+        }
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/send-bulk", [], $body);
     }
 
     /** @return array<string,mixed> */
     public function batchStatus(string $sessionId, string $batchId): array
     {
-        return $this->http->request('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/batch/{$this->http->encodeSegment($batchId)}");
+        return $this->http->requestArray('GET', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/batch/{$this->http->encodeSegment($batchId)}");
     }
 
     /** @return array<string,mixed> */
     public function cancelBatch(string $sessionId, string $batchId): array
     {
-        return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/batch/{$this->http->encodeSegment($batchId)}/cancel");
+        return $this->http->requestArray('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/messages/batch/{$this->http->encodeSegment($batchId)}/cancel");
     }
 }

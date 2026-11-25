@@ -8,7 +8,9 @@
 import { encodeSegment } from '../http.js';
 import type { OpenWAClient } from '../client.js';
 import type {
+  UpsertContactRequest,
   CheckNumberResponse,
+  ContactLidResponse,
   ContactPhoneResponse,
   ContactRecord,
   ProfilePictureResponse,
@@ -41,7 +43,7 @@ export class ContactsResource {
     });
   }
 
-  /** Check whether a phone number is registered on WhatsApp. */
+  /** Check whether a phone number is registered on WhatsApp. Requires an OPERATOR-level key. */
   check(sessionId: string, number: string): Promise<CheckNumberResponse> {
     return this.client.request<CheckNumberResponse>({
       method: 'GET',
@@ -77,6 +79,19 @@ export class ContactsResource {
     });
   }
 
+  /**
+   * Look up the `@lid` WhatsApp holds for a phone number, without sending a message. `lid` is `null` when WhatsApp
+   * holds none, which an unregistered number also answers. The lookup can query WhatsApp (Baileys on every call,
+   * whatsapp-web.js when the page holds no LID), so bulk lookups put the linked account at risk. Requires an
+   * OPERATOR-level key.
+   */
+  lid(sessionId: string, number: string): Promise<ContactLidResponse> {
+    return this.client.request<ContactLidResponse>({
+      method: 'GET',
+      path: `/api/sessions/${encodeSegment(sessionId)}/contacts/${encodeSegment(number)}/lid`,
+    });
+  }
+
   /** Block a contact. Requires an OPERATOR-level key. */
   block(sessionId: string, contactId: string): Promise<SuccessResult> {
     return this.client.request<SuccessResult>({
@@ -85,11 +100,44 @@ export class ContactsResource {
     });
   }
 
+  /**
+   * Save a contact to the account's addressbook, or edit an existing entry.
+   * Requires an OPERATOR-level key.
+   */
+  upsert(sessionId: string, contactId: string, body: UpsertContactRequest): Promise<SuccessResult> {
+    return this.client.request<SuccessResult>({
+      method: 'PUT',
+      path: `/api/sessions/${encodeSegment(sessionId)}/contacts/${encodeSegment(contactId)}`,
+      body,
+    });
+  }
+
+  /** Remove a contact from the account's addressbook. Requires an OPERATOR-level key. */
+  delete(sessionId: string, contactId: string): Promise<SuccessResult> {
+    return this.client.request<SuccessResult>({
+      method: 'DELETE',
+      path: `/api/sessions/${encodeSegment(sessionId)}/contacts/${encodeSegment(contactId)}`,
+    });
+  }
+
   /** Unblock a contact. Requires an OPERATOR-level key. */
   unblock(sessionId: string, contactId: string): Promise<SuccessResult> {
     return this.client.request<SuccessResult>({
       method: 'DELETE',
       path: `/api/sessions/${encodeSegment(sessionId)}/contacts/${encodeSegment(contactId)}/block`,
+    });
+  }
+
+  /**
+   * List the JIDs this account has blocked.
+   *
+   * Session-wide, so it takes no contact id — unlike {@link block} and {@link unblock}, which act on
+   * one contact. Resolves a bare array of ids, not contact records.
+   */
+  listBlocked(sessionId: string): Promise<string[]> {
+    return this.client.request<string[]>({
+      method: 'GET',
+      path: `/api/sessions/${encodeSegment(sessionId)}/contacts/blocked`,
     });
   }
 }

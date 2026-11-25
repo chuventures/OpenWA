@@ -1,6 +1,23 @@
+import { AsyncLocalStorage } from 'async_hooks';
 import * as path from 'path';
+import { ConfigService } from '@nestjs/config';
+import { DataSource, type Repository } from 'typeorm';
 import { WorkerThreadChannel } from './worker-thread-channel';
 import { PluginWorkerHost } from './plugin-worker-host';
+import { HookManager, type HookEvent } from '../../hooks';
+import { EngineRegistry } from '../../../engine/engine-registry.service';
+import type { IncomingMessage, IWhatsAppEngine } from '../../../engine/interfaces/whatsapp-engine.interface';
+import { Message } from '../../../modules/message/entities/message.entity';
+import { MessageSendService } from '../../../modules/message/message-send.service';
+import { SendPacingService } from '../../../modules/message/send-pacing.service';
+import { MessageProjector } from '../../../modules/session/message-projector.service';
+import type { Session } from '../../../modules/session/entities/session.entity';
+import type { SessionService } from '../../../modules/session/session.service';
+import type { TemplateService } from '../../../modules/template/template.service';
+import type { EventsGateway } from '../../../modules/events/events.gateway';
+import type { WebhookService } from '../../../modules/webhook/webhook.service';
+import type { StatusStoreService } from '../../../modules/status-store/status-store.service';
+import type { SessionLidResolver } from '../../../modules/session/session-lid-resolver.service';
 
 // Repo root, from src/core/plugins/sandbox.
 const ROOT = path.resolve(__dirname, '../../../..');
@@ -9,6 +26,7 @@ const FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/echo-plugin.cjs');
 const CAP_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/cap-echo-plugin.cjs');
 const HOOK_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/hook-plugin.cjs');
 const HOOK_HANG_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/hook-hang-plugin.cjs');
+const BUSY_HOOK_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/busy-hook-plugin.cjs');
 const RUNAWAY_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/runaway-plugin.cjs');
 const CTX_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/ctx-aware-plugin.cjs');
 const HOOK_CONFIG_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/hook-config-plugin.cjs');
@@ -16,6 +34,10 @@ const HOOK_ERROR_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/hook-error-
 const CTX_LIFECYCLE_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/ctx-lifecycle-plugin.cjs');
 const SEARCH_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/search-plugin.cjs');
 const UNLOAD_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/unload-plugin.cjs');
+const UNCLONEABLE_LOG_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/uncloneable-log-plugin.cjs');
+const CONFIG_THROW_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/config-throw-plugin.cjs');
+const IDLE_SPIN_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/idle-spin-plugin.cjs');
+const SENT_ECHO_FIXTURE = path.resolve(ROOT, 'test/fixtures/sandbox/sent-echo-plugin.cjs');
 const flushAsync = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
 
 // Run the TS bootstrap inside the worker via ts-node. The base tsconfig is nodenext; we pin the
@@ -80,7 +102,7 @@ describe('plugin worker — real worker_threads round-trip (B1)', () => {
     // so this resolving proves the full worker -> host -> worker round-trip.
     await host.runLifecycle('onEnable');
 
-    expect(dispatcher).toHaveBeenCalledWith('messages.sendText', ['s', 'c', 'hi']);
+    expect(dispatcher).toHaveBeenCalledWith('messages.sendText', ['s', 'c', 'hi'], undefined, expect.any(AbortSignal));
     await host.terminate();
   });
 
@@ -118,7 +140,7 @@ describe('plugin worker — real worker_threads round-trip (B1)', () => {
       timeoutMs: 200,
       onTimeout,
     });
-    expect(result).toEqual({ continue: true });
+    expect(result).toEqual({ continue: true, error: 'hook timed out after 200ms' });
     expect(onTimeout).toHaveBeenCalled();
     await host.terminate();
   });
@@ -131,9 +153,88 @@ describe('plugin worker — real worker_threads round-trip (B1)', () => {
     // shutdown is impossible. terminate() must still reclaim the thread.
     const wedged = host.runLifecycle('onEnable');
     wedged.catch(() => undefined); // terminate() rejects this pending call; swallow it
-    await new Promise(resolve => setTimeout(resolve, 150));
+    // Poll until the loop is genuinely blocked rather than sleeping a fixed 150ms: the health-check
+    // message is queued behind the onEnable call (FIFO on one channel), so it can only time out once
+    // the infinite loop has actually started. Firing terminate() earlier would reclaim an idle worker
+    // and prove nothing.
+    const wedgeDeadline = Date.now() + 10_000;
+    for (;;) {
+      const health = await host.healthCheck(150);
+      if (!health.healthy) break;
+      if (Date.now() > wedgeDeadline) throw new Error('runaway plugin never blocked the worker event loop');
+    }
 
     await expect(host.terminate()).resolves.toBeUndefined();
+  });
+
+  const probingHost = (onUnresponsive: () => void): PluginWorkerHost =>
+    new PluginWorkerHost(
+      makeChannel(),
+      undefined,
+      () => undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      300,
+      onUnresponsive,
+    );
+
+  it('a slow async hook handler answers the liveness probe, so it is not reported', async () => {
+    const onUnresponsive = jest.fn();
+    const host = probingHost(onUnresponsive);
+    try {
+      await host.load(HOOK_HANG_FIXTURE);
+      await host.runLifecycle('onEnable');
+      await flushAsync();
+
+      await host.dispatchHook({ event: 'message:received', data: {}, source: 'Engine', timeoutMs: 200 });
+      await new Promise(resolve => setTimeout(resolve, 900));
+      expect(onUnresponsive).not.toHaveBeenCalled();
+    } finally {
+      await host.terminate();
+    }
+  });
+
+  it('a worker working through a burst of short synchronous handlers is not reported', async () => {
+    const onUnresponsive = jest.fn();
+    const host = probingHost(onUnresponsive);
+    try {
+      await host.load(BUSY_HOOK_FIXTURE);
+      await host.runLifecycle('onEnable');
+      await flushAsync();
+
+      // ~1 s of queued work against a 300 ms hook budget and a 300 ms probe: most dispatches time out
+      // and the ping waits behind the backlog, but results keep arriving the whole time.
+      const burst = Array.from({ length: 100 }, () =>
+        host.dispatchHook({ event: 'message:received', data: {}, source: 'Engine', timeoutMs: 300 }),
+      );
+      await Promise.all(burst);
+      await expect(host.healthCheck(5000)).resolves.toMatchObject({ healthy: true });
+      expect(onUnresponsive).not.toHaveBeenCalled();
+    } finally {
+      await host.terminate();
+    }
+  });
+
+  it('reports a worker whose event loop is blocked, and terminate() reclaims it', async () => {
+    let reported!: () => void;
+    const unresponsive = new Promise<void>(resolve => (reported = resolve));
+    const host = probingHost(() => reported());
+    try {
+      await host.load(RUNAWAY_FIXTURE);
+      const wedged = host.runLifecycle('onEnable');
+      wedged.catch(() => undefined); // terminate() rejects this pending call
+
+      // The dispatch queues behind the spinning onEnable and times out; the ping behind it is never read.
+      await host.dispatchHook({ event: 'message:received', data: {}, source: 'Engine', timeoutMs: 200 });
+      await unresponsive;
+    } finally {
+      await expect(host.terminate()).resolves.toBeUndefined();
+    }
   });
 
   it('a throwing worker hook handler is reported back on the hook-result (not silently swallowed)', async () => {
@@ -246,6 +347,58 @@ describe('plugin worker — real worker_threads round-trip (B1)', () => {
     await host.terminate();
   });
 
+  it('keeps the worker alive when a timer logs a meta the structured clone cannot copy', async () => {
+    const logs: Array<{ level: string; message: string; meta?: Record<string, unknown> }> = [];
+    const host = new PluginWorkerHost(makeChannel(), undefined, undefined, undefined, (level, message, meta) =>
+      logs.push({ level, message, meta }),
+    );
+
+    try {
+      await host.load(UNCLONEABLE_LOG_FIXTURE, { pluginId: 'uncloneable-log', config: {} });
+      await host.runLifecycle('onEnable');
+
+      // A DataCloneError thrown from the timer used to be uncaught in the worker, so the worker exited.
+      await expect(host.healthCheck(3000)).resolves.toEqual({ healthy: true, message: 'alive' });
+      expect(logs).toContainEqual({ level: 'warn', message: 'timer log', meta: undefined });
+      // The error reason is a string, so it still crosses when the rest of the meta cannot.
+      expect(logs).toContainEqual({ level: 'error', message: 'timer error', meta: { error: 'upstream down' } });
+    } finally {
+      await host.terminate();
+    }
+  });
+
+  it('keeps the worker alive when a synchronous onConfigChange throws, and logs why', async () => {
+    const logs: Array<{ level: string; message: string; meta?: Record<string, unknown> }> = [];
+    const onExit = jest.fn();
+    const host = new PluginWorkerHost(
+      makeChannel(),
+      undefined,
+      undefined,
+      undefined,
+      (level, message, meta) => logs.push({ level, message, meta }),
+      undefined,
+      undefined,
+      undefined,
+      onExit,
+    );
+    try {
+      await host.load(CONFIG_THROW_FIXTURE, { pluginId: 'config-throw', config: { mode: 'ok' } });
+      await host.runLifecycle('onEnable');
+
+      host.sendConfigChange({ mode: 'bad' });
+
+      await expect(host.healthCheck(3000)).resolves.toEqual({ healthy: true, message: 'alive' });
+      expect(logs).toContainEqual({
+        level: 'error',
+        message: 'onConfigChange threw',
+        meta: { error: 'unsupported mode: bad' },
+      });
+      expect(onExit).not.toHaveBeenCalled();
+    } finally {
+      await host.terminate();
+    }
+  });
+
   it('delivers healthCheck and onConfigChange to a sandboxed plugin (and refreshes ctx.config)', async () => {
     const host = new PluginWorkerHost(makeChannel());
     await host.load(CTX_LIFECYCLE_FIXTURE, { pluginId: 'ctx-lc', config: { a: 1 } });
@@ -297,5 +450,305 @@ describe('plugin worker — real worker_threads round-trip (B1)', () => {
     if (empty.ok) expect(empty.results.hits).toEqual([]);
 
     await host.terminate();
+  });
+
+  it('detects an idle worker spinning in while(true) with zero hooks dispatched via periodic livenessIntervalMs', async () => {
+    let reported!: () => void;
+    const unresponsive = new Promise<void>(resolve => (reported = resolve));
+    const host = new PluginWorkerHost(
+      makeChannel(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      300,
+      () => reported(),
+      150,
+    );
+    try {
+      await host.load(IDLE_SPIN_FIXTURE);
+      await host.runLifecycle('onEnable');
+      // Dispatch zero hooks: the worker enters while(true) on its own timer and must be caught by
+      // the periodic idle liveness probe.
+      await unresponsive;
+    } finally {
+      await expect(host.terminate()).resolves.toBeUndefined();
+    }
+  });
+
+  it('suppresses message:sent echo loops for a sandboxed worker plugin calling ctx.messages.sendText', async () => {
+    const db = await new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [Message],
+      synchronize: true,
+    }).initialize();
+    let host: PluginWorkerHost | undefined;
+    try {
+      const repo = db.getRepository(Message);
+      const hm = new HookManager();
+      const engines = new EngineRegistry();
+      const emitMessageSent = jest.fn();
+      const webhookDispatch = jest.fn().mockResolvedValue(undefined);
+      let nextSeq = 2;
+
+      const sendTextMessage = jest.fn((chatId: string, text: string) => {
+        const id = `SANDBOX-MSG-${nextSeq++}`;
+        const timestamp = Math.floor(Date.now() / 1000);
+        setImmediate(() => {
+          const echo: IncomingMessage = {
+            id,
+            chatId,
+            from: '620000@c.us',
+            to: chatId,
+            fromMe: true,
+            body: text,
+            type: 'text',
+            timestamp,
+            isGroup: false,
+            kind: 'individual',
+          };
+          projector.handleOwnSendEcho('s1', engine, echo);
+        });
+        return Promise.resolve({ id, timestamp });
+      });
+      const engine = {
+        sendTextMessage,
+        sendChatState: jest.fn().mockResolvedValue(undefined),
+      } as unknown as IWhatsAppEngine;
+      engines.set('s1', engine);
+
+      const sessionRepo = { update: jest.fn().mockResolvedValue({ affected: 1 }) } as unknown as Repository<Session>;
+      const projector = new MessageProjector(
+        repo,
+        sessionRepo,
+        engines,
+        { emitMessage: jest.fn(), emitMessageSent } as unknown as EventsGateway,
+        { dispatch: webhookDispatch } as unknown as WebhookService,
+        hm,
+        {} as StatusStoreService,
+        { resolveSenderPhone: jest.fn().mockResolvedValue(null) } as unknown as SessionLidResolver,
+      );
+
+      const config = new ConfigService({ features: { simulateTyping: false } });
+      const sender = new MessageSendService(
+        repo,
+        { findOne: jest.fn().mockResolvedValue({ id: 's1', phone: '620000' }) } as unknown as SessionService,
+        engines,
+        hm,
+        {} as TemplateService,
+        new SendPacingService(repo, sessionRepo),
+        config,
+      );
+
+      const dispatchedToWorker: string[] = [];
+      host = new PluginWorkerHost(
+        makeChannel(),
+        async (verb, args) => {
+          if (verb === 'messages.sendText') {
+            return sender.sendText(args[0] as string, {
+              chatId: args[1] as string,
+              text: args[2] as string,
+            });
+          }
+          throw new Error(`unexpected verb: ${verb}`);
+        },
+        event => {
+          hm.register('sent-echo', event as HookEvent, async hookCtx => {
+            dispatchedToWorker.push((hookCtx.data as IncomingMessage).id);
+            const result = await host!.dispatchHook({
+              event,
+              data: hookCtx.data,
+              sessionId: hookCtx.sessionId,
+              source: hookCtx.source,
+              inFlight: hm.currentInFlight(),
+              timeoutMs: 5000,
+            });
+            return { continue: result.continue, data: result.data };
+          });
+        },
+        undefined,
+        undefined,
+        (events, run) => hm.runInFlight(events as HookEvent[], run),
+      );
+
+      await host.load(SENT_ECHO_FIXTURE);
+      await host.runLifecycle('onEnable');
+      await flushAsync();
+
+      projector.handleOwnSendEcho('s1', engine, {
+        id: 'SANDBOX-MSG-1',
+        chatId: '628111@c.us',
+        from: '620000@c.us',
+        to: '628111@c.us',
+        fromMe: true,
+        body: 'initial',
+        type: 'text',
+        timestamp: 1_700_000_000,
+        isGroup: false,
+        kind: 'individual',
+      });
+
+      // Wait for async worker IPC + echo cycle to settle.
+      const deadline = Date.now() + 5000;
+      while (emitMessageSent.mock.calls.length < 2 && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      expect(dispatchedToWorker).toEqual(['SANDBOX-MSG-1']);
+      expect(sendTextMessage).toHaveBeenCalledTimes(1);
+      expect(emitMessageSent).toHaveBeenCalledTimes(2);
+      expect(webhookDispatch).toHaveBeenCalledTimes(2);
+      const rows = await repo.find({ order: { waMessageId: 'ASC' } });
+      expect(rows.map(r => r.waMessageId)).toEqual(['SANDBOX-MSG-1', 'SANDBOX-MSG-2']);
+    } finally {
+      await host?.terminate();
+      await db.destroy();
+    }
+  });
+
+  it('suppresses early own-send echo arriving before engine.sendTextMessage resolves for a sandboxed worker', async () => {
+    const runAtRoot = AsyncLocalStorage.snapshot();
+    const db = await new DataSource({
+      type: 'better-sqlite3',
+      database: ':memory:',
+      entities: [Message],
+      synchronize: true,
+    }).initialize();
+    let host: PluginWorkerHost | undefined;
+    try {
+      const repo = db.getRepository(Message);
+      const hm = new HookManager();
+      const engines = new EngineRegistry();
+      const emitMessageSent = jest.fn();
+      const webhookDispatch = jest.fn().mockResolvedValue(undefined);
+      let nextSeq = 2;
+
+      const sendTextMessage = jest.fn((chatId: string, text: string) => {
+        const id = `SANDBOX-EARLY-${nextSeq++}`;
+        const timestamp = Math.floor(Date.now() / 1000);
+        // Simulate whatsapp-web.js emitting message_create at 5ms in a root ALS context
+        // before sendTextMessage resolves { id, timestamp } at 40ms.
+        runAtRoot(() => {
+          setTimeout(() => {
+            projector.handleOwnSendEcho('s1', engine, {
+              id,
+              chatId,
+              from: '620000@c.us',
+              to: chatId,
+              fromMe: true,
+              body: text,
+              type: 'text',
+              timestamp,
+              isGroup: false,
+              kind: 'individual',
+            });
+          }, 5);
+        });
+        return new Promise<{ id: string; timestamp: number }>(resolve => {
+          setTimeout(() => resolve({ id, timestamp }), 40);
+        });
+      });
+      const engine = {
+        sendTextMessage,
+        sendChatState: jest.fn().mockResolvedValue(undefined),
+      } as unknown as IWhatsAppEngine;
+      engines.set('s1', engine);
+
+      const sessionRepo = { update: jest.fn().mockResolvedValue({ affected: 1 }) } as unknown as Repository<Session>;
+      const projector = new MessageProjector(
+        repo,
+        sessionRepo,
+        engines,
+        { emitMessage: jest.fn(), emitMessageSent } as unknown as EventsGateway,
+        { dispatch: webhookDispatch } as unknown as WebhookService,
+        hm,
+        {} as StatusStoreService,
+        { resolveSenderPhone: jest.fn().mockResolvedValue(null) } as unknown as SessionLidResolver,
+      );
+
+      const config = new ConfigService({ features: { simulateTyping: false } });
+      const sender = new MessageSendService(
+        repo,
+        { findOne: jest.fn().mockResolvedValue({ id: 's1', phone: '620000' }) } as unknown as SessionService,
+        engines,
+        hm,
+        {} as TemplateService,
+        new SendPacingService(repo, sessionRepo),
+        config,
+      );
+
+      const dispatchedToWorker: string[] = [];
+      host = new PluginWorkerHost(
+        makeChannel(),
+        async (verb, args) => {
+          if (verb === 'messages.sendText') {
+            return sender.sendText(args[0] as string, {
+              chatId: args[1] as string,
+              text: args[2] as string,
+            });
+          }
+          throw new Error(`unexpected verb: ${verb}`);
+        },
+        event => {
+          hm.register('sent-echo', event as HookEvent, async hookCtx => {
+            dispatchedToWorker.push((hookCtx.data as IncomingMessage).id);
+            if (dispatchedToWorker.length > 3) {
+              return { continue: true, data: hookCtx.data };
+            }
+            const result = await host!.dispatchHook({
+              event,
+              data: hookCtx.data,
+              sessionId: hookCtx.sessionId,
+              source: hookCtx.source,
+              inFlight: hm.currentInFlight(),
+              timeoutMs: 5000,
+            });
+            return { continue: result.continue, data: result.data };
+          });
+        },
+        undefined,
+        undefined,
+        (events, run) => hm.runInFlight(events as HookEvent[], run),
+      );
+
+      await host.load(SENT_ECHO_FIXTURE);
+      await host.runLifecycle('onEnable');
+      await flushAsync();
+
+      projector.handleOwnSendEcho('s1', engine, {
+        id: 'SANDBOX-EARLY-1',
+        chatId: '628111@c.us',
+        from: '620000@c.us',
+        to: '628111@c.us',
+        fromMe: true,
+        body: 'initial',
+        type: 'text',
+        timestamp: 1_700_000_000,
+        isGroup: false,
+        kind: 'individual',
+      });
+
+      const deadline = Date.now() + 5000;
+      while (emitMessageSent.mock.calls.length < 2 && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      await new Promise(resolve => setTimeout(resolve, 200));
+
+      expect(dispatchedToWorker).toEqual(['SANDBOX-EARLY-1']);
+      expect(sendTextMessage).toHaveBeenCalledTimes(1);
+      expect(emitMessageSent).toHaveBeenCalledTimes(2);
+      expect(webhookDispatch).toHaveBeenCalledTimes(2);
+      expect(hm.consumeEchoOrigin('s1', 'SANDBOX-EARLY-2')).toBe(false);
+    } finally {
+      await host?.terminate();
+      await db.destroy();
+    }
   });
 });

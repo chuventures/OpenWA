@@ -5,12 +5,14 @@ import static com.rmyndharis.openwa.http.Http.encodeSegment;
 import com.rmyndharis.openwa.OpenWAClient;
 import com.rmyndharis.openwa.http.HttpMethod;
 import com.rmyndharis.openwa.model.CheckNumberResponse;
+import com.rmyndharis.openwa.model.ContactLidResponse;
 import com.rmyndharis.openwa.model.ContactPhoneResponse;
 import com.rmyndharis.openwa.model.ContactRecord;
 import com.rmyndharis.openwa.model.ListContactsQuery;
 import com.rmyndharis.openwa.model.ProfilePictureResponse;
 import com.rmyndharis.openwa.model.ProfilePicturesResponse;
 import com.rmyndharis.openwa.model.SuccessResult;
+import com.rmyndharis.openwa.model.UpsertContactRequest;
 import java.util.List;
 import java.util.Map;
 
@@ -42,7 +44,7 @@ public final class ContactsResource {
             ContactRecord.class);
     }
 
-    /** Check whether a phone number is registered on WhatsApp. */
+    /** Check whether a phone number is registered on WhatsApp. Requires an OPERATOR-level key. */
     public CheckNumberResponse check(String sessionId, String number) {
         return client.request(
             HttpMethod.GET,
@@ -64,7 +66,7 @@ public final class ContactsResource {
 
     /**
      * Batch-resolve profile picture URLs for up to 50 contacts in one request.
-     * Returns a map of contact id → URL (null when a lookup fails).
+     * Returns a map of contact id → URL (null when a lookup fails). An id skipped after a lookup timed out is absent from the map; ask for it again.
      */
     public ProfilePicturesResponse profilePictures(String sessionId, List<String> ids) {
         return client.request(
@@ -85,11 +87,46 @@ public final class ContactsResource {
             ContactPhoneResponse.class);
     }
 
+    /**
+     * Look up the {@code @lid} WhatsApp holds for a phone number, without sending a message. {@code lid} is
+     * {@code null} when WhatsApp holds none, which an unregistered number also answers. The lookup can query
+     * WhatsApp (Baileys on every call, whatsapp-web.js when the page holds no LID), so bulk lookups put the
+     * linked account at risk. Requires an OPERATOR-level key.
+     */
+    public ContactLidResponse lid(String sessionId, String number) {
+        return client.request(
+            HttpMethod.GET,
+            "/api/sessions/" + encodeSegment(sessionId) + "/contacts/" + encodeSegment(number) + "/lid",
+            null,
+            null,
+            ContactLidResponse.class);
+    }
+
     /** Block a contact. Requires an OPERATOR-level key. */
     public SuccessResult block(String sessionId, String contactId) {
         return client.request(
             HttpMethod.POST,
             "/api/sessions/" + encodeSegment(sessionId) + "/contacts/" + encodeSegment(contactId) + "/block",
+            null,
+            null,
+            SuccessResult.class);
+    }
+
+    /** Save a contact to the addressbook, or edit an existing entry. Requires an OPERATOR key. */
+    public SuccessResult upsert(String sessionId, String contactId, UpsertContactRequest body) {
+        return client.request(
+            HttpMethod.PUT,
+            "/api/sessions/" + encodeSegment(sessionId) + "/contacts/" + encodeSegment(contactId),
+            null,
+            body,
+            SuccessResult.class);
+    }
+
+    /** Remove a contact from the addressbook. Requires an OPERATOR key. */
+    public SuccessResult delete(String sessionId, String contactId) {
+        return client.request(
+            HttpMethod.DELETE,
+            "/api/sessions/" + encodeSegment(sessionId) + "/contacts/" + encodeSegment(contactId),
             null,
             null,
             SuccessResult.class);
@@ -103,5 +140,19 @@ public final class ContactsResource {
             null,
             null,
             SuccessResult.class);
+    }
+
+    /**
+     * List the JIDs this account has blocked. Session-wide, so it takes no contact id — unlike
+     * {@link #block} and {@link #unblock}, which act on one contact — and it returns bare ids
+     * rather than contact records.
+     */
+    public List<String> listBlocked(String sessionId) {
+        return client.requestList(
+            HttpMethod.GET,
+            "/api/sessions/" + encodeSegment(sessionId) + "/contacts/blocked",
+            null,
+            null,
+            String.class);
     }
 }

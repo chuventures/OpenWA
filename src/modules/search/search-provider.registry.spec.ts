@@ -22,6 +22,11 @@ describe('SearchProviderRegistry', () => {
     r.register(mk('b'));
     r.setActive('b');
     expect(r.active()?.id).toBe('b');
+    // A plugin re-enable registers the same id again: no duplicate, and the active choice stands.
+    r.register(mk('a'));
+    expect(r.active()?.id).toBe('b');
+    expect(r.list()).toHaveLength(2);
+    expect(() => r.setActive('zz')).toThrow(/unknown search provider/);
     r.unregister('b');
     expect(r.active()?.id).toBe('a');
     r.unregister('a');
@@ -38,5 +43,13 @@ describe('SearchProviderRegistry', () => {
         .map(p => p.id)
         .sort(),
     ).toEqual(['a', 'b']);
+  });
+
+  it('get looks up a provider by id and returns null when absent', () => {
+    const r = new SearchProviderRegistry();
+    const a = mk('a');
+    r.register(a);
+    expect(r.get('a')).toBe(a);
+    expect(r.get('missing')).toBeNull();
   });
 });

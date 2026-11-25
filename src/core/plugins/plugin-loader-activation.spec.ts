@@ -41,8 +41,8 @@ describe('PluginLoaderService — per-session activation gate (hook delivery)', 
 
   function register(plugin: PluginInstance, handler: HookHandler): void {
     const ctx = (
-      loader as unknown as { createPluginContext: (p: PluginInstance) => PluginContext }
-    ).createPluginContext(plugin);
+      loader as unknown as { capabilities: { createPluginContext: (p: PluginInstance) => PluginContext } }
+    ).capabilities.createPluginContext(plugin);
     ctx.registerHook('message:received', handler);
   }
 
@@ -93,7 +93,8 @@ describe('PluginLoaderService — per-session activation gate (hook delivery)', 
       loader.setPluginSessions('act-ext', ['sess-1', 'sess-2']);
 
       expect(plugin.activeSessions).toEqual(['sess-1', 'sess-2']);
-      expect(setSessions).toHaveBeenCalledWith('act-ext', ['sess-1', 'sess-2']);
+      // No write options: a best-effort write, as every caller but the plugin API uses.
+      expect(setSessions).toHaveBeenCalledWith('act-ext', ['sess-1', 'sess-2'], undefined);
     });
 
     it('rejects activating a global (non-session-scoped) plugin per session', () => {
